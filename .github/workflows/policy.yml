@@ -60,12 +60,10 @@ on:
 permissions:
   contents: read
 
-# On pull_request_target, github.ref is the default branch for every PR, so the group is keyed on the PR
-# number (else one PR's run would cancel another's), and on the event (else a PR's two runs would cancel
-# each other).
-concurrency:
-  group: policy-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+# No `concurrency:` on purpose. A concurrency group is shared by every workflow of the repository, and a
+# PR can add a workflow of its own: with the same group name it could cancel the base-branch run, and a
+# cancelled run that a later passing `policy` run replaces no longer blocks the harness. A run on an older
+# head simply finishes; the harness reads only the runs on the current head.
 
 jobs:
   policy:
