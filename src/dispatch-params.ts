@@ -3575,9 +3575,54 @@ export function isSiteRunSlot(value: unknown): value is number {
   return value >= SITE_RUN_SLOT_MIN && value <= SITE_RUN_SLOT_MAX;
 }
 
-/** True when `value` is a site slug in the grammar above. */
+/**
+ * The slot names derived from a live slug share one name space with live slugs: the staging copy of
+ * site X lives in platform/X-staging, a dev-branch preview in platform/X-dev<N>, and its staging media
+ * under the R2 prefix sg-X. A site slugged "X-dev1" would have platform/X-dev1 as its LIVE config dir,
+ * the same directory that site X's dev1 preview mounts. So a slug that ends in a slot suffix, or starts
+ * with the staging prefix, is refused here, whatever app reserves (the Worker must not rely on app alone).
+ */
+const DERIVED_SLOT_SUFFIXES = ["staging", "dev1", "dev2", "dev3"] as const;
+const STAGING_MEDIA_SLUG_PREFIX = "sg-";
+/** One derived slot of a live site: its staging copy or one of its dev-branch previews. */
+export type DerivedSlot = (typeof DERIVED_SLOT_SUFFIXES)[number];
+
+/** The rule text of a site slug, shared by every refusal that names it. */
+const SITE_SLUG_RULE =
+  "a site slug ([a-z0-9-], 1-46 chars, alphanumeric at both ends; it may not end in -dev1, -dev2, -dev3 or -staging, and not start with sg-)";
+
+/** True when `slug` is in the name space of a derived slot (ends in -staging or -dev1..3, or starts with sg-). */
+export function isReservedSlotSlug(slug: string): boolean {
+  if (slug.startsWith(STAGING_MEDIA_SLUG_PREFIX)) {
+    return true;
+  }
+  for (const slot of DERIVED_SLOT_SUFFIXES) {
+    if (slug.endsWith(`-${slot}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** True when `value` is a site slug in the grammar above, outside the derived slot name space. */
 export function isSiteSlug(value: unknown): value is string {
-  return typeof value === "string" && SITE_SLUG_RE.test(value);
+  if (typeof value !== "string" || !SITE_SLUG_RE.test(value)) {
+    return false;
+  }
+  return !isReservedSlotSlug(value);
+}
+
+/**
+ * THE ONE place a slot name is built from a live slug: `<slug>-staging` or `<slug>-dev<N>`. It throws a
+ * RangeError for a slug that is not a site slug (including a reserved one), because a caller only gets
+ * here after a validator checked the slug; a reserved slug here is a programming error that must not
+ * produce a plausible-looking path. Policy rule dy-derived-slot-name flags any slot name built elsewhere.
+ */
+export function derivedSlotNameFor(liveSlug: string, slot: DerivedSlot): string {
+  if (!isSiteSlug(liveSlug)) {
+    throw new RangeError(`a slot name needs ${SITE_SLUG_RULE}, got ${JSON.stringify(liveSlug)}`);
+  }
+  return `${liveSlug}-${slot}`;
 }
 
 /** Throw unless `slot` is a Run slot. Every derive helper calls this first. */
@@ -3852,7 +3897,7 @@ function validateGcpSiteSubnetRef(raw: Record<string, unknown>, op: string): Par
     return { ok: false, reason: `slot must be a Run slot: an integer from ${SITE_RUN_SLOT_MIN} to ${SITE_RUN_SLOT_MAX}` };
   }
   if (!isSiteSlug(siteSlug)) {
-    return { ok: false, reason: "siteSlug must be a site slug ([a-z0-9-], 1-46 chars, alphanumeric at both ends)" };
+    return { ok: false, reason: `siteSlug must be ${SITE_SLUG_RULE}` };
   }
   // NEVER the probe form's free-form keys: the site form names its subnet by `network` + `subnet` (or
   // derives both), and always derives the range. A caller that sends the probe keys has confused the
@@ -4263,8 +4308,7 @@ const CLOUD_RUN_PROBE_TARGETS_MAX = 8;
 // A Cloud Run SERVICE name: a Compute-style name capped at 49 characters (the name becomes a label
 // of the generated *.run.app hostname).
 const CLOUD_RUN_SERVICE_NAME_RE = /^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$/;
-// The part of a session service name after its prefix: the site slug.
-const CLOUD_RUN_SESSION_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+// The part of a session service name after its prefix is a site slug: isSiteSlug checks it.
 // A container image reference PINNED BY DIGEST: <host>[:port]/<path>@sha256:<64 hex>. No tag form
 // is accepted (review M1/L2): a tag can be repointed by its publisher, a digest cannot. The probe
 // image is pinned exactly (CLOUD_RUN_PROBE_IMAGE), and a session image to SESSION_IMAGE_REPO plus the
@@ -4306,14 +4350,18 @@ const PRIVATE_IPV4_ADDRESS_RE = new RegExp(
     `|192\\.168(?:\\.${IPV4_OCTET}){2})$`,
 );
 
-/** True when `name` is a session service name: `<prefix>-<slug>`, prefix from the fixed list. */
+/**
+ * True when `name` is a session service name: `<prefix>-<slug>`, prefix from the fixed list, and the slug
+ * a site slug (isSiteSlug). So a slug in the derived slot name space ("docs-dev1", "sg-docs") is refused by
+ * every op that takes a session name, not only by the upsert.
+ */
 function isCloudRunSessionServiceName(name: string): boolean {
   if (!CLOUD_RUN_SERVICE_NAME_RE.test(name)) {
     return false;
   }
   for (const prefix of CLOUD_RUN_SESSION_SERVICE_PREFIXES) {
     const head = `${prefix}-`;
-    if (name.startsWith(head) && CLOUD_RUN_SESSION_SLUG_RE.test(name.slice(head.length))) {
+    if (name.startsWith(head) && isSiteSlug(name.slice(head.length))) {
       return true;
     }
   }
@@ -4392,9 +4440,10 @@ export function splitCloudRunSessionServiceName(
  * the site's files. siteSessionReadOnlyNfsPathsFor lists the paths that must also be read-only.
  */
 export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
+  // derivedSlotNameFor throws for a reserved slug, so no path below can name another site's config dir.
   const sitesPath = `${SITE_STORAGE_ROOT}/sites/${slug}`;
   const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
-  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${derivedSlotNameFor(slug, "staging")}`;
   if (prefix === "term") {
     return [sitesPath, platformPath];
   }
@@ -4408,13 +4457,13 @@ export function siteSessionNfsPathsFor(prefix: CloudRunSessionServicePrefix, slu
     return [stagingPlatformPath];
   }
   if (isDevBranchSessionPrefix(prefix)) {
-    return [`${sitesPath}/${prefix}`, `${SITE_STORAGE_ROOT}/platform/${slug}-${prefix}`];
+    return [`${sitesPath}/${prefix}`, `${SITE_STORAGE_ROOT}/platform/${derivedSlotNameFor(slug, prefix)}`];
   }
   return [];
 }
 
 /** True for the dev-branch preview prefixes (dev1, dev2, dev3; hub#473). */
-function isDevBranchSessionPrefix(prefix: CloudRunSessionServicePrefix): boolean {
+function isDevBranchSessionPrefix(prefix: CloudRunSessionServicePrefix): prefix is "dev1" | "dev2" | "dev3" {
   return prefix === "dev1" || prefix === "dev2" || prefix === "dev3";
 }
 
@@ -4442,7 +4491,7 @@ function isWordPressPreviewSessionPrefix(prefix: CloudRunSessionServicePrefix): 
  */
 export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePrefix, slug: string): string[] {
   const platformPath = `${SITE_STORAGE_ROOT}/platform/${slug}`;
-  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${derivedSlotNameFor(slug, "staging")}`;
   if (prefix === "pma") {
     return [platformPath, stagingPlatformPath];
   }
@@ -4450,7 +4499,7 @@ export function siteSessionReadOnlyNfsPathsFor(prefix: CloudRunSessionServicePre
     return [stagingPlatformPath];
   }
   if (isDevBranchSessionPrefix(prefix)) {
-    return [`${SITE_STORAGE_ROOT}/platform/${slug}-${prefix}`];
+    return [`${SITE_STORAGE_ROOT}/platform/${derivedSlotNameFor(slug, prefix)}`];
   }
   return [];
 }
@@ -4536,7 +4585,8 @@ function pmaSessionStagingServerReason(
   const envEntries = env ?? [];
   const wpConfigEntry = envEntries.find((entry) => entry.name === "DY_STAGING_WPCONFIG_REAL");
   const databaseNameEntry = envEntries.find((entry) => entry.name === "DY_STAGING_DB_NAME");
-  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${slug}-staging`;
+  const stagingSlotName = derivedSlotNameFor(slug, "staging");
+  const stagingPlatformPath = `${SITE_STORAGE_ROOT}/platform/${stagingSlotName}`;
   const mountsStagingPlatform = (nfsVolumes ?? []).some((volume) => volume.path === stagingPlatformPath);
 
   if (wpConfigEntry === undefined && databaseNameEntry === undefined) {
@@ -4552,7 +4602,7 @@ function pmaSessionStagingServerReason(
   if (databaseNameEntry.value !== stagingDatabaseName) {
     return `a pma- session's staging server entry must use the schema ${stagingDatabaseName} (DY_STAGING_DB_NAME), not another schema`;
   }
-  const stagingWpConfigPath = `/platform/${slug}-staging/wp-config-real.php`;
+  const stagingWpConfigPath = `/platform/${stagingSlotName}/wp-config-real.php`;
   if (wpConfigEntry.value !== stagingWpConfigPath) {
     return `a pma- session's staging server entry must read ${stagingWpConfigPath} (DY_STAGING_WPCONFIG_REAL), not another file`;
   }
@@ -4917,7 +4967,7 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
     // a tag, uppercase hex or a trailing newline gets this refusal, which names the pinned repo.
     const sessionImageName = splitCloudRunSessionServiceName(serviceName as string);
     if (sessionImageName === null) {
-      return { ok: false, reason: "serviceName must be <prefix>-<slug> with a site slug ([a-z0-9-], alphanumeric at both ends)" };
+      return { ok: false, reason: `serviceName must be <prefix>-<slug> with ${SITE_SLUG_RULE}` };
     }
     const imageName = SESSION_IMAGE_NAMES[sessionImageName.prefix];
     const expectedImagePrefix = `${SESSION_IMAGE_REPO}/${imageName}@sha256:`;
@@ -5034,7 +5084,7 @@ export function validateCloudRunServiceUpsertParams(raw: unknown): ParamsVerdict
     }
     const sessionName = splitCloudRunSessionServiceName(serviceName as string);
     if (sessionName === null) {
-      return { ok: false, reason: "serviceName must be <prefix>-<slug> with a site slug ([a-z0-9-], alphanumeric at both ends)" };
+      return { ok: false, reason: `serviceName must be <prefix>-<slug> with ${SITE_SLUG_RULE}` };
     }
     const allowedPaths = siteSessionNfsPathsFor(sessionName.prefix, sessionName.slug);
     const readOnlyPaths = siteSessionReadOnlyNfsPathsFor(sessionName.prefix, sessionName.slug);

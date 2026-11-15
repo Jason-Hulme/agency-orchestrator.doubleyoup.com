@@ -85,6 +85,74 @@ test_allows_a_workflow_with_no_pull_request_target_trigger if {
 	}
 }
 
+# hub#495: the policy gate runs on pull_request_target so that its workflow comes from the base branch.
+# That is allowed only with a read-only token and no secret.
+read_only_target_workflow := {
+	"true": {"pull_request_target": null, "push": {"branches": ["main"]}},
+	"permissions": {"contents": "read"},
+	"jobs": {"policy": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo ok"}]}},
+}
+
+test_allows_pull_request_target_with_a_read_only_token_and_no_secret if {
+	count(deny) == 0 with input as read_only_target_workflow
+}
+
+test_allows_pull_request_target_with_read_all if {
+	count(deny) == 0 with input as object.union(read_only_target_workflow, {"permissions": "read-all"})
+}
+
+test_denies_pull_request_target_with_a_write_scope_at_workflow_level if {
+	msgs := deny with input as object.union(read_only_target_workflow, {"permissions": {"contents": "read", "pull-requests": "write"}})
+	some msg in msgs
+	contains(msg, "read-only token")
+}
+
+test_denies_pull_request_target_with_a_write_scope_in_a_job if {
+	writing_job := {"policy": {"permissions": {"id-token": "write"}, "steps": [{"run": "echo ok"}]}}
+	msgs := deny with input as object.union(read_only_target_workflow, {"jobs": writing_job})
+	some msg in msgs
+	contains(msg, "read-only token")
+}
+
+test_denies_pull_request_target_with_write_all if {
+	msgs := deny with input as object.union(read_only_target_workflow, {"permissions": "write-all"})
+	some msg in msgs
+	contains(msg, "read-only token")
+}
+
+test_denies_pull_request_target_with_only_job_level_permissions if {
+	job_only := {"true": "pull_request_target", "jobs": {"policy": {"permissions": {"contents": "read"}, "steps": [{"run": "echo ok"}]}}}
+	msgs := deny with input as job_only
+	some msg in msgs
+	contains(msg, "read-only token")
+}
+
+test_denies_pull_request_target_that_names_a_secret if {
+	secret_step := {"policy": {"steps": [{"run": "echo ok", "env": {"TOKEN": "${{ secrets.DEPLOY_TOKEN }}"}}]}}
+	msgs := deny with input as object.union(read_only_target_workflow, {"jobs": secret_step})
+	some msg in msgs
+	contains(msg, "name no secret")
+}
+
+test_denies_pull_request_target_that_names_a_secret_by_index if {
+	secret_step := {"policy": {"steps": [{"uses": "x/y@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f", "with": {"token": "${{ secrets['DEPLOY_TOKEN'] }}"}}]}}
+	msgs := deny with input as object.union(read_only_target_workflow, {"jobs": secret_step})
+	some msg in msgs
+	contains(msg, "name no secret")
+}
+
+test_denies_pull_request_target_that_inherits_secrets if {
+	inherit_job := {"call": {"uses": "./.github/workflows/build.yml", "secrets": "inherit"}}
+	msgs := deny with input as object.union(read_only_target_workflow, {"jobs": inherit_job})
+	some msg in msgs
+	contains(msg, "name no secret")
+}
+
+test_allows_the_word_secrets_in_plain_text if {
+	plain := {"policy": {"steps": [{"name": "no secrets here", "run": "echo the job reads no secrets"}]}}
+	count(deny) == 0 with input as object.union(read_only_target_workflow, {"jobs": plain})
+}
+
 test_denies_a_job_with_no_permissions if {
 	msgs := deny with input as {"jobs": {"build": {"steps": []}}}
 	some msg in msgs
@@ -431,4 +499,16 @@ test_allows_the_github_context_passed_through_env_with_tojson if {
 		}],
 	}}}
 	count(deny) == 0 with input as safe
+}
+
+# hub#495 rule gap A2: a local composite action has `runs:`, not `jobs:`, and is not an inert document.
+test_composite_action_is_not_inert if {
+	msgs := deny with input as {"runs": {"using": "composite", "steps": [{"run": "echo ok", "shell": "bash"}]}}
+	count(msgs) == 0
+}
+
+test_document_without_jobs_or_composite_runs_is_still_inert if {
+	msgs := deny with input as {"runs": {"using": "node20", "main": "index.js"}}
+	some msg in msgs
+	contains(msg, "policy is inert")
 }

@@ -69,6 +69,10 @@ import {
   siteSessionNfsPathsFor,
   siteSessionReadOnlyNfsPathsFor,
   splitCloudRunSessionServiceName,
+  isSiteSlug,
+  isReservedSlotSlug,
+  derivedSlotNameFor,
+  CLOUD_RUN_SESSION_SERVICE_PREFIXES,
   siteStagingDatabaseNameFor,
   PMA_STAGING_SERVER_ENV_NAMES,
   validateGcpSubnetsListParams,
@@ -557,7 +561,7 @@ const CLOUD_RUN_PROBE_REF_PARAMS = { project: "dy-agency-proof", region: "austra
 // this marker up to, not including, the next section rule after it). Changing the block means changing
 // BOTH twins and BOTH pins in one go.
 const TWIN_BLOCK_START_MARKER = "// ── planning/49: the agency-side ephemeral-compute ops";
-const TWIN_BLOCK_SHA256 = "2b7c31387eef23483dc94aa79e79f497b8bac16e1fa0a2a7bae17055117771a8";
+const TWIN_BLOCK_SHA256 = "c34af3b1fcf98d7a165790a31c351a77b331042a7341333fcaf7f45a1b72ab2b";
 
 function planning49Job(op: DispatchJob["op"], params: unknown, nonce: string): DispatchJob {
   return sampleJob({ op, params: JSON.stringify(params), nonce });
@@ -3884,6 +3888,68 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     // The 49-character label budget holds: dev1- plus a 44-character slug is the longest name.
     expect(splitCloudRunSessionServiceName(`dev1-${"d".repeat(44)}`)).toEqual({ prefix: "dev1", slug: "d".repeat(44) });
     expect(splitCloudRunSessionServiceName(`dev1-${"d".repeat(45)}`)).toBeNull();
+  });
+
+  it("a slug in a derived slot's name space is refused, so a preview's config dir never equals another site's live one", () => {
+    // The collision: the dev1 preview of site "docs" mounts platform/docs-dev1, which is also the live
+    // config dir of a site slugged "docs-dev1" (term-docs-dev1 or pma-docs-dev1 would mount it as LIVE).
+    // The same holds for "-staging" (staging-docs vs a site slugged "docs-staging"). Every slug that
+    // ends in a reserved slot suffix, or starts with the staging media prefix "sg-", is refused.
+    const reservedSlugs = ["docs-dev1", "docs-dev2", "docs-dev3", "docs-staging", "sg-docs", "a-dev1", "x-staging"];
+    for (const slug of reservedSlugs) {
+      expect(isSiteSlug(slug), slug).toBe(false);
+      expect(isReservedSlotSlug(slug), slug).toBe(true);
+      for (const prefix of CLOUD_RUN_SESSION_SERVICE_PREFIXES) {
+        expect(splitCloudRunSessionServiceName(`${prefix}-${slug}`), `${prefix}-${slug}`).toBeNull();
+        expectRefused(
+          validateCloudRunServiceUpsertParams({ ...SITE_SESSION_PARAMS, image: sessionImageFor(`${prefix}-${slug}`), serviceName: `${prefix}-${slug}` }),
+          /^serviceName must be a session service name/,
+        );
+        expectRefused(validateCloudRunServiceGetParams({ project: "dy-agency-proof", region: "australia-southeast1", serviceName: `${prefix}-${slug}` }), /^serviceName must be/);
+        expectRefused(validateCloudRunServiceDeleteParams({ project: "dy-agency-proof", region: "australia-southeast1", serviceName: `${prefix}-${slug}` }), /^serviceName must be/);
+        expect(() => siteSessionNfsPathsFor(prefix, slug), `${prefix} ${slug}`).toThrow(RangeError);
+        expect(() => siteSessionReadOnlyNfsPathsFor(prefix, slug), `${prefix} ${slug}`).toThrow(RangeError);
+      }
+      expectRefused(
+        validateGcpSubnetCreateParams({ project: "dy-agency-proof", region: "australia-southeast2", slot: 5, siteSlug: slug }),
+        /^siteSlug must be a site slug .* not end in -dev1, -dev2, -dev3 or -staging, and not start with sg-/,
+      );
+      expect(siteSlugFromSubnetDescription(`doubleyoup site subnet: ${slug}`), slug).toBe(null);
+    }
+
+    // So no two (prefix, slug) pairs that the Worker accepts reach the same platform/ config dir.
+    const ownerByConfigDir = new Map<string, string>();
+    for (const slug of ["docs", "docs-dev1", "docs-staging", "sg-docs", "docs-dev12", "docs-devs", "dev1-docs", "staging-docs", "sgdocs", "docs-sg"]) {
+      for (const prefix of CLOUD_RUN_SESSION_SERVICE_PREFIXES) {
+        const serviceName = `${prefix}-${slug}`;
+        const split = splitCloudRunSessionServiceName(serviceName);
+        if (split === null) {
+          continue;
+        }
+        for (const path of siteSessionNfsPathsFor(split.prefix, split.slug)) {
+          if (!path.startsWith("/srv/dy-storage/platform/")) {
+            continue;
+          }
+          // One config dir serves one site: the same site's term- and pma- may share it, another site may not.
+          const owner = ownerByConfigDir.get(path);
+          if (owner !== undefined) {
+            expect(owner, `${path} is reached by ${owner} and ${slug}`).toBe(split.slug);
+          }
+          ownerByConfigDir.set(path, split.slug);
+        }
+      }
+    }
+
+    // Slugs that only look close stay valid: the reservation is the exact suffix or prefix.
+    for (const slug of ["docs", "docs-dev12", "docs-dev4", "docs-devs", "docs-stagingx", "dev1-docs", "staging-docs", "sgdocs", "docs-sg"]) {
+      expect(isSiteSlug(slug), slug).toBe(true);
+      expect(isReservedSlotSlug(slug), slug).toBe(false);
+    }
+    // The helper builds each slot name from a valid slug, and refuses an invalid or reserved one.
+    expect(derivedSlotNameFor("docs", "staging")).toBe("docs-staging");
+    expect(derivedSlotNameFor("docs", "dev2")).toBe("docs-dev2");
+    expect(() => derivedSlotNameFor("docs-dev1", "dev1")).toThrow(RangeError);
+    expect(() => derivedSlotNameFor("Docs", "staging")).toThrow(RangeError);
   });
 
   it("cloudrun-service-upsert SESSION (planning/49 Phase 4): pma mounts only platform/<slug>, spma only platform/<slug>-staging, both read-only", () => {

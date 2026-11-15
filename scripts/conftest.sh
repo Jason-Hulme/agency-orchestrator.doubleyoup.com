@@ -16,6 +16,9 @@
 #   scripts/conftest.sh verify          run the Rego unit tests instead
 #   scripts/conftest.sh test --no-color plain output
 #
+# POLICY_TARGET_ROOT=<folder> reads the targets from another checkout. The policies always come from this
+# script's own repo. scripts/policy-gate.sh uses it to check a PR's files with the base branch's policies.
+#
 # conftest exits non-zero on a `deny`. A `warn` is advisory and does not fail the run unless you
 # pass --fail-on-warn.
 #
@@ -35,6 +38,7 @@ if ! command -v conftest > /dev/null 2>&1; then
 fi
 
 POLICY_ROOT=.policy-as-code/.conftest
+TARGET_ROOT=${POLICY_TARGET_ROOT:-.}
 
 MODE="test"
 if [ "$#" -gt 0 ]; then
@@ -73,24 +77,33 @@ else
   # exactly the one that would carry it. Globbed so a new workflow is covered the day it is
   # added.
   #
-  # GitHub runs both `.yml` and `.yaml` files in this folder, so both are collected. A glob that
-  # matches nothing stays a literal pattern in POSIX sh, and conftest would fail on that missing
-  # path, so a pattern is only kept when it names a real file.
+  # GitHub runs both `.yml` and `.yaml` files in this folder, so both are collected. Every local
+  # composite action is collected too (hub#495 rule gap A2): it runs with the token of the job that
+  # calls it, so its `uses:` steps need the same pins. A glob that matches nothing stays a literal
+  # pattern in POSIX sh, and conftest would fail on that missing path, so a pattern is only kept when
+  # it names a real file.
   workflow_files=""
-  for workflow_file in .github/workflows/*.yml .github/workflows/*.yaml; do
+  for workflow_file in "$TARGET_ROOT"/.github/workflows/*.yml "$TARGET_ROOT"/.github/workflows/*.yaml "$TARGET_ROOT"/.github/actions/*/action.yml "$TARGET_ROOT"/.github/actions/*/action.yaml; do
     if [ ! -f "$workflow_file" ]; then
       continue
     fi
+    case "$workflow_file" in
+      *[[:space:]]*)
+        echo "Refusing the workflow file name '$workflow_file': it holds whitespace, which would split it into other paths." >&2
+        exit 1
+        ;;
+    esac
     workflow_files="$workflow_files $workflow_file"
   done
 
   if [ -z "$workflow_files" ]; then
-    echo "No workflow files found in .github/workflows." >&2
+    echo "No workflow files found in $TARGET_ROOT/.github/workflows." >&2
     exit 1
   fi
 
-  # The file names come from a glob of the repo's own workflow folder; word splitting here is
-  # intended and a name with a space is not a valid workflow name in this repo.
+  # The file names come from a glob of the target's workflow folder; word splitting here is intended,
+  # and a name with a space is not a valid workflow name in this repo. A PR could add such a name, so
+  # the gate refuses one rather than let it split into paths that skip the file.
   # shellcheck disable=SC2086
   run_policy_dir "$POLICY_ROOT/workflows" $workflow_files "$@"
 fi
