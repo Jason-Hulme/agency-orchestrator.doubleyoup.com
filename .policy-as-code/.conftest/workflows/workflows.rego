@@ -119,9 +119,55 @@ script_reads_unsafe_github_context(script) if {
 	not is_safe_github_reference(reference)
 }
 
+# pull_request_target runs the DEFAULT branch's workflow, with the base repository's token and secrets, on
+# a pull request's event. It is the one trigger that lets a gate run code the PR cannot edit, which the
+# policy gate needs (hub#495: a PR must not be able to turn its own `policy` check green). It is allowed
+# only when that token can do nothing a reader could not: every `permissions:` value in the file is read
+# or none (with workflow-level permissions declared, so no job falls back to the repository default), and
+# the file names no secret. Checking out the PR's code under it is caught by semgrep rule
+# dy-gha-target-code-checkout, which needs a reviewed `nosemgrep` with the reason for a data-only checkout.
+read_only_permission_values := {"read", "none"}
+
+permissions_are_read_only(permissions) if {
+	permissions == "read-all"
+}
+
+permissions_are_read_only(permissions) if {
+	is_object(permissions)
+	every _, value in permissions {
+		value in read_only_permission_values
+	}
+}
+
+workflow_token_is_read_only if {
+	permissions_are_read_only(object.get(input, "permissions", "missing"))
+	every _, job in object.get(input, "jobs", {}) {
+		permissions_are_read_only(object.get(job, "permissions", "read-all"))
+	}
+}
+
+# Any `secrets.` or `secrets[` in any string of the file, including `secrets: inherit` on a job-level call.
+workflow_names_a_secret if {
+	walk(input, [_, value])
+	is_string(value)
+	regex.match(`(?i)(^|[^a-z0-9_])secrets\s*(\.|\[)`, value)
+}
+
+workflow_names_a_secret if {
+	some _, job in object.get(input, "jobs", {})
+	object.get(job, "secrets", "") == "inherit"
+}
+
 deny contains msg if {
 	"pull_request_target" in trigger_names
-	msg := "Workflow: the pull_request_target trigger runs with the base repository's secrets while checking out a fork's code. In a repo whose deploy job can reach the production VM, that is the one trigger to never use. Use pull_request, and gate anything privileged behind a separate approved job."
+	not workflow_token_is_read_only
+	msg := "Workflow: the pull_request_target trigger runs with the base repository's token on a pull request's event. It is allowed only with a read-only token: declare workflow-level `permissions:` with every value read or none, and give no job a write scope."
+}
+
+deny contains msg if {
+	"pull_request_target" in trigger_names
+	workflow_names_a_secret
+	msg := "Workflow: the pull_request_target trigger runs with the base repository's secrets on a pull request's event. A pull_request_target workflow must name no secret (no secrets.* and no `secrets: inherit`)."
 }
 
 deny contains msg if {
@@ -149,8 +195,14 @@ deny contains msg if {
 }
 
 # Canary. A workflow always has jobs, so finding none means the parsed shape changed and the
-# rules above are matching nothing.
+# rules above are matching nothing. A local composite action (.github/actions/<name>/action.yml, scanned
+# for supply_chain.rego since hub#495 rule gap A2) has `runs:` instead of `jobs:`, so it is not inert.
+is_composite_action if {
+	object.get(object.get(input, "runs", {}), "using", "") == "composite"
+}
+
 deny contains msg if {
 	not input.jobs
+	not is_composite_action
 	msg := "Workflow policy is inert: the parsed document has no `jobs` key, so the rules in workflows.rego cannot match. Check the shape with a probe policy before trusting a pass."
 }

@@ -1,0 +1,46 @@
+# hub#495 rule C11: a slot name derived from a live slug is built in ONE helper.
+#
+# THE HAZARD. A staging copy, a dev<N> preview and a live site share one name space: platform/<name> is
+# the config dir of whichever site or slot is called <name>. `${slug}-dev1` built by hand is also the live
+# config dir of a site slugged `<slug>-dev1`, and `sg-${slug}` is the name of a site slugged `sg-<slug>`.
+# The Worker keeps the two apart in one place: derivedSlotNameFor() in src/dispatch-params.ts builds every
+# slot name, and it refuses a slug that is itself in the slot name space (isReservedSlotSlug). A slot name
+# built anywhere else skips that refusal.
+#
+# WHAT IT MATCHES. A template or `+` that appends `-staging`, `-dev<N>` or `-dev${n}` to a value, puts
+# `sg-` in front of one, or builds `platform/${slug}-<anything>`. The helper itself is excluded with
+# pattern-not-inside. A different name space with similar text (a MariaDB name `${db}_staging`, a fixed
+# string such as "--no-staging") does not match.
+rules:
+  - id: dy-derived-slot-name
+    message: >-
+      A staging or dev slot name is built by hand from a slug. Slot names share one name space with live
+      slugs (platform/<name>), so build them only with derivedSlotNameFor() in src/dispatch-params.ts,
+      which refuses a slug in the slot name space (hub#495 rule C11).
+    severity: ERROR
+    languages: [typescript]
+    paths:
+      include:
+        - "/src/"
+        - "*.ts"
+      exclude:
+        - "*.test.ts"
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: "`$...BEFORE${$VALUE}$...AFTER`"
+              - pattern-regex: \$\{[^}`]+\}-(staging\b|dev(\$\{|[0-9]))
+          - patterns:
+              - pattern: "`$...BEFORE${$VALUE}$...AFTER`"
+              - pattern-regex: (^|[^a-z0-9])sg-\$\{
+          - patterns:
+              - pattern: "`$...BEFORE${$VALUE}$...AFTER`"
+              - pattern-regex: platform/\$\{[^}`]+\}-
+          - pattern: $VALUE + "-staging"
+          - pattern: '$VALUE + "-dev" + $N'
+          - pattern: '"sg-" + $VALUE'
+          - pattern: "'sg-' + $VALUE"
+      - pattern-not-inside: |
+          function derivedSlotNameFor(...) { ... }
+      - pattern-not-inside: |
+          export function derivedSlotNameFor(...) { ... }
