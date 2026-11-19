@@ -1,0 +1,34 @@
+# hub#495 rule C12: an SSH client that does not check the server's host key.
+#
+# THE HAZARD. `StrictHostKeyChecking=no` accepts any host key, and `UserKnownHostsFile=/dev/null` throws
+# away every key it learnt, so each connection trusts whoever answers. A machine in the path (a DNS answer,
+# a hijacked route) then gets the key's session. Pin the host key instead: StrictHostKeyChecking=yes
+# against a known_hosts file that holds the expected key.
+#
+# WHAT IT MATCHES. The option in any spelling the client accepts (`-o Name=value`, `-o "Name value"`, a
+# config line), case-insensitive, in shell, workflow YAML, JavaScript and TypeScript. `accept-new` is not
+# matched: it pins the key on the first connection. This repo has no SSH client today; the rule keeps it
+# that way for a new one.
+rules:
+  - id: dy-ssh-hostkey-check-off
+    message: >-
+      SSH host-key checking is off (StrictHostKeyChecking=no or UserKnownHostsFile=/dev/null). Every
+      connection then trusts whoever answers, and a machine in the path gets the key's session. Pin the
+      host key: StrictHostKeyChecking=yes with a known_hosts file that holds the expected key (hub#495
+      rule C12).
+    severity: ERROR
+    languages: [generic]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*.dockerfile"
+        - "*.sh"
+        - "*.bash"
+        - "*.yml"
+        - "*.yaml"
+        - "*.ts"
+        - "*.mjs"
+        - "*.js"
+      exclude:
+        - "*.test.ts"
+    pattern-regex: (?i)(StrictHostKeyChecking\s*[= ]\s*["']?(no|off)\b|UserKnownHostsFile\s*[= ]\s*["']?/dev/null)
