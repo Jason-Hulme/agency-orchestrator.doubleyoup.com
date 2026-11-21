@@ -38,6 +38,10 @@
 //                     and its bucket), not with a Direction-B signature. Delete, rename and
 //                     overwrite move the old object to trash/ first; new objects are created
 //                     once through a presigned PUT.
+//   GET  /enroll-host — hub#476: the manual enrol command for a self-hosted server Cloudflare cannot
+//                     reach over SSH, rendered only from this Worker's own installer pin.
+//   POST /enroll-host — hub#476: the installer trades the agency's one-time HOST_ENROLL_CODE and the
+//                     cell's enrol facts for the bootstrap material (src/enroll-host.ts).
 //
 // NOTE on inbound auth: /validate and /complete are Phase-1 endpoints the agency
 // triggers themselves, so they are intentionally open. /actuate is the Direction-B
@@ -57,6 +61,7 @@ import { DISPATCH_OP_REGISTRY, parseDispatchParams } from "./ops.js";
 import { nonceExpiresAtMs } from "./nonce-store.js";
 import { handleMediaSiteRequest, isMediaSiteAction } from "./media-site-api.js";
 import { mintSessionGateIdToken, type SessionGateMintResult } from "./session-gate/minter.js";
+import { ENROLL_HOST_PATH, handleEnrollHostPage, handleEnrollHostPost } from "./enroll-host.js";
 
 // Re-exported so wrangler can bind the Durable Object class declared in wrangler.toml. The
 // DO must be an export of the configured `main` worker script.
@@ -305,6 +310,12 @@ export default {
     }
     if (method === "POST" && path === "/actuate") {
       return handleActuate(request, env);
+    }
+    if (method === "GET" && path === ENROLL_HOST_PATH) {
+      return handleEnrollHostPage(request, env);
+    }
+    if (method === "POST" && path === ENROLL_HOST_PATH) {
+      return handleEnrollHostPost(request, env);
     }
     if (method === "POST" && path.startsWith(MEDIA_ROUTE_PREFIX)) {
       const action = path.slice(MEDIA_ROUTE_PREFIX.length);

@@ -179,6 +179,27 @@ export interface Env {
   // in wrangler.toml.
   DY_WORKER_NAME?: string;
 
+  // ── hub#476 / planning/58: self-hosted servers ────────────────────────────
+  // The root of every host-agent token. A cell's token is HKDF-SHA256(HOST_AGENT_MASTER_KEY, cellId)
+  // (actuate-host.ts::deriveHostAgentToken); only this Worker can derive it. At least 32 characters
+  // (openssl rand -hex 32). Rotating it invalidates every host-agent token of this Worker: each server
+  // needs host-repair (or the manual enrol again) to take the new one.
+  HOST_AGENT_MASTER_KEY?: string;
+  // The installer pin (planning/58 §6.2), set by the AGENCY, never by a job: the one https origin that
+  // serves /self-hosted/host-install-<sha256>.sh, and 1-4 accepted installer sha256 values, comma-separated.
+  // host-bootstrap / host-repair / GET /enroll-host refuse any other installer. Not secrets, but set them with
+  // `wrangler secret put` for the CF_CUSTOM_HOSTNAME_ZONE reason (a redeploy removes plain variables).
+  HOST_INSTALLER_ORIGIN?: string;
+  HOST_INSTALLER_SHA256S?: string;
+  // The one-time enrol code of the manual path (POST /enroll-host, planning/58 §7.4). At least 32 characters;
+  // a new value for each enrolment. A used value is refused.
+  HOST_ENROLL_CODE?: string;
+  // Per server N (1-99), read by name (actuate-host.ts), so they are not listed as fields:
+  //   SELF_HOSTED_<N>_SSH_KEY   secret: the server's unencrypted OpenSSH ed25519 private key. Used ONLY by
+  //                             host-ssh-check, host-bootstrap and host-repair. Never logged or returned.
+  //   SELF_HOSTED_<N>_HOST_KEY  the server's ED25519 host-key fingerprint, SHA256:<43 chars>. The Worker
+  //                             refuses a job naming another fingerprint and a server presenting another key.
+
   // AI provider keys.
   ANTHROPIC_API_KEY?: string;
   OPENROUTER_API_KEY?: string;

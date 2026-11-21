@@ -141,6 +141,20 @@ export const DISPATCH_OPS = [
   "media-trash-list",
   "media-restore",
   "media-bulk-credential",
+  // hub#476 / planning/58 §6 — self-hosted servers. Three SSH ops that log in with the agency's own key
+  // (SELF_HOSTED_<N>_SSH_KEY) to a host key the agency pinned (SELF_HOSTED_<N>_HOST_KEY), and eight host-agent ops
+  // that reach the server's host-agent over the cell's tunnel with sealed requests (HOST_AGENT_MASTER_KEY).
+  "host-ssh-check",
+  "host-bootstrap",
+  "host-repair",
+  "host-network-ensure",
+  "host-vm-create",
+  "host-vm-get",
+  "host-vm-list",
+  "host-vm-delete",
+  "host-vm-restart",
+  "host-vm-snapshot",
+  "host-vm-set-boot-script",
 ] as const;
 export type DispatchOp = (typeof DISPATCH_OPS)[number];
 
