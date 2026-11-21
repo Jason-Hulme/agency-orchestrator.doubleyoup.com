@@ -2,8 +2,8 @@
 #
 # Deployed by each AGENCY into their OWN Cloudflare account (pulled from our
 # GitHub). Phase 1 = onboarding + credential self-validation only — no
-# infrastructure provisioning. Uses only Web APIs (fetch + Web Crypto), so no
-# nodejs_compat flag is needed.
+# infrastructure provisioning. Uses only Web APIs (fetch + Web Crypto, and
+# cloudflare:sockets for the hub#476 SSH ops), so no nodejs_compat flag is needed.
 #
 # CONFIG lives entirely in Cloudflare vars/secrets — NEVER hardcode a secret here.
 #
@@ -38,6 +38,35 @@
 #       wrangler secret put CF_CUSTOM_HOSTNAME_ZONE    # hub#46: the agency zone NAME that holds its customers' custom hostnames, e.g. example.com (a secret so a redeploy keeps it)
 #       wrangler secret put ANTHROPIC_API_KEY
 #       wrangler secret put OPENROUTER_API_KEY
+#
+#   Self-hosted servers (hub#476, planning/58; only for an agency that runs cells on its own Ubuntu or Mac server):
+#       wrangler secret put HOST_AGENT_MASTER_KEY      # at least 32 characters (openssl rand -hex 32). The root of every
+#                                                      # host-agent token: token = HKDF-SHA256(this key, cellId). Only this
+#                                                      # Worker holds it. Rotate: put a new value, then run host-repair for
+#                                                      # each server (or the manual enrol again); until then the server's
+#                                                      # host-agent refuses this Worker. Remove: only when no self-hosted
+#                                                      # cell is left (the host-* VM ops stop working).
+#     Per server N (1-99, the agency's own number for the server; the app records only N):
+#       wrangler secret put SELF_HOSTED_<N>_SSH_KEY    # the server's ed25519 private key, unencrypted OpenSSH format
+#                                                      # (ssh-keygen -t ed25519 -N ''). Add its public key to the login's
+#                                                      # authorized_keys yourself. Used ONLY by host-ssh-check, host-bootstrap
+#                                                      # and host-repair; never logged or returned.
+#       wrangler secret put SELF_HOSTED_<N>_HOST_KEY   # the server's ED25519 host-key fingerprint, SHA256:… (from
+#                                                      # ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). The Worker refuses a
+#                                                      # job naming another fingerprint and a server presenting another key.
+#       Rotate the key: put a new SELF_HOSTED_<N>_SSH_KEY, add the new public key to authorized_keys, run
+#         host-ssh-check, then remove the old public key. A new host key needs a new SELF_HOSTED_<N>_HOST_KEY and the
+#         new fingerprint in the app's server form.
+#       Remove: delete SELF_HOSTED_<N>_SSH_KEY, SELF_HOSTED_<N>_HOST_KEY and the authorized_keys line. The cells keep
+#         running (they never use SSH after the bootstrap); host-repair is lost, the manual enrol path still works.
+#     The installer pin (the platform cannot change it; host-bootstrap, host-repair and /enroll-host refuse any other):
+#       wrangler secret put HOST_INSTALLER_ORIGIN      # https://<host> that serves /self-hosted/host-install-<sha256>.sh
+#       wrangler secret put HOST_INSTALLER_SHA256S     # 1-4 installer sha256 values you accept, comma-separated; add a
+#                                                      # release's sha256 after you read it, drop old ones after the update
+#     The manual enrol path (a server Cloudflare cannot reach over SSH, e.g. behind NAT; open GET /enroll-host):
+#       wrangler secret put HOST_ENROLL_CODE           # at least 32 characters, a NEW value for each enrolment (one-time;
+#                                                      # a used value is refused). Delete it when no enrolment is pending.
+#     (These are set as secrets, not [vars], so a redeploy of this shared wrangler.toml keeps them.)
 #
 # Deploy (needs `wrangler login` against the agency's Cloudflare account):
 #   1. npm install
