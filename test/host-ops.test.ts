@@ -240,6 +240,10 @@ describe("host-ssh-check refusals before any connection", () => {
     expect(preflightProblems(base)).toEqual([]);
     expect(preflightProblems({ ...base, os: "centos" })).toHaveLength(1);
     expect(preflightProblems({ ...base, virtualization: "none" })).toEqual(["KVM is not available (/dev/kvm is missing)"]);
+    // A fresh Mac has no Multipass yet: host-bootstrap installs it, so host-ssh-check must not refuse it.
+    const freshMac = { ...base, os: "macos", osVersion: "14.5", arch: "arm64", virtualization: "none" as const, isRoot: false, canSudo: false };
+    expect(preflightProblems(freshMac)).toEqual([]);
+    expect(preflightProblems({ ...freshMac, memoryMiB: 2048 })).toHaveLength(1);
     expect(preflightProblems({ ...base, memoryMiB: 1024, cpuCount: 1, diskFreeGiB: 5 })).toHaveLength(3);
     expect(preflightProblems({ ...base, canSudo: false })).toEqual(["the login is not root and cannot run sudo without a password"]);
   });

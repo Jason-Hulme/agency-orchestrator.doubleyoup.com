@@ -154,7 +154,8 @@ if [ "$(uname -s)" = Darwin ]; then
   cpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
   mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
   mem_mib=$((mem_bytes / 1048576))
-  if command -v multipass >/dev/null 2>&1; then virt=multipass; fi
+  # An SSH exec session has only the default PATH; Multipass lives in the Homebrew or pkg install folders.
+  if PATH="$PATH:/usr/local/bin:/opt/homebrew/bin" command -v multipass >/dev/null 2>&1; then virt=multipass; fi
 else
   if [ -r /etc/os-release ]; then
     os=$(. /etc/os-release && echo "\${ID:-unknown}")
@@ -430,12 +431,10 @@ export function preflightProblems(facts: HostPreflightFacts): string[] {
   if (!(HOST_SUPPORTED_ARCH as readonly string[]).includes(facts.arch)) {
     problems.push(`the CPU architecture is ${facts.arch}; supported are x86_64 and arm64`);
   }
-  if (facts.virtualization === "none") {
-    if (facts.os === "macos") {
-      problems.push("Multipass is not installed");
-    } else {
-      problems.push("KVM is not available (/dev/kvm is missing)");
-    }
+  // On macOS the installer installs Multipass itself (planning/58 §5.1), so a missing Multipass is not below the
+  // floor; `virtualization` is reported for information only. On Linux, KVM is hardware the installer cannot add.
+  if (facts.virtualization === "none" && facts.os !== "macos") {
+    problems.push("KVM is not available (/dev/kvm is missing)");
   }
   if (facts.cpuCount < HOST_MIN_CPU_COUNT) {
     problems.push(`the server has ${facts.cpuCount} CPUs; at least ${HOST_MIN_CPU_COUNT} are needed`);
@@ -647,6 +646,11 @@ export async function actuateHostInstall(op: "host-bootstrap" | "host-repair", p
   const answer = lastJsonLine(redact(utf8Text(execResult.stdout), secretValues));
   if (answer === null || !(HOST_INSTALL_STATES as readonly unknown[]).includes(answer.state)) {
     return failure("installer-failed", `the installer gave no result line (exit status ${execResult.exitCode}): ${stderrTail}`);
+  }
+  if (execResult.exitCode !== 0) {
+    // The installer printed a result line and then ended badly. The answer stands; the next poll shows the real
+    // state, but the log keeps the exit status for the operator.
+    logHostOpFailure(op, `installer exit status ${execResult.exitCode} after result line`, targetText);
   }
   const result: HostBootstrapResult = {
     ok: true,
