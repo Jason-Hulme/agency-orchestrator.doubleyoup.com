@@ -2829,7 +2829,7 @@ export function validateGcpInstanceRestartParams(raw: unknown): ParamsVerdict<Gc
 // SAFE + ADDITIVE (planning/39 increment 1): this only writes a public-key FILE on the gateway;
 // it changes no sshd_config and does nothing until a LATER shell Match block references the file.
 //
-// Three params, each strictly grammared:
+// Four params, each strictly grammared:
 //   1. `project` — the agency's GCP project id (the existing GCP project grammar). It selects the
 //      agency's cell at the platform layer; the gateway cell-agent itself only needs slug + keys.
 //   2. `slug`    — the site slug (the existing storage-tier slug grammar, <=27 so `site_<slug>`
@@ -2840,6 +2840,21 @@ export function validateGcpInstanceRestartParams(raw: unknown): ParamsVerdict<Gc
 //      legitimate: it revokes every key (the gateway writes an empty file). Charset + a per-key
 //      length cap + a bounded array length are the guard; the gateway script re-validates every
 //      line (defence in depth), so a malformed key can never reach an authorized_keys file.
+//   4. `generation` — app's always-increasing number for this push (an integer
+//      0..SSH_KEYS_GENERATION_MAX). The gateway script refuses a push older than the one it last
+//      wrote, so a late push can never put back a removed key. REQUIRED (review L-5): a job without
+//      it makes the gateway write whatever it is sent, with no check against a newer set, so such a
+//      job is never signed or actuated. Absent or not such an integer = rejected.
+//
+// agency-orchestrator#22 adds three OPTIONAL keys on the Worker side (additive; the app twin adds the same
+// keys in app#239, and the orchestrator signs them since orchestrator#88):
+//   `uid`              — the site's uid (Site.uid, 100000-9999999). The gateway checks it against the owner
+//                        of /sites/<slug>, and a push after a site delete needs it.
+//   `gatewayAgentUrl`  — the GATEWAY cell-agent of the SITE'S OWN cell, exactly `https://<lowercase host>`,
+//   `gatewayAgentToken`  and its bearer (64 lowercase hex). Both or neither. app binds the URL to a gateway
+//                        host of the site's own cell before it signs, so an agency with several cells
+//                        writes the keys on the right gateway. The Worker posts the keys ONLY to this
+//                        pair: a job without it is refused, never sent to the web node's CELL_AGENT_URL.
 
 export interface ProvisionSshKeysParams {
   /** The agency's GCP project id — selects the agency's cell at the platform layer. */
@@ -2848,6 +2863,14 @@ export interface ProvisionSshKeysParams {
   slug: string;
   /** The FULL desired set of authorized OpenSSH public keys (0..MAX). */
   authorizedKeys: string[];
+  /** app's always-increasing push number; the gateway refuses an older one. REQUIRED (review L-5). */
+  generation: number;
+  /** OPTIONAL: the site's uid (Site.uid). Relayed to the gateway, which checks it against /sites/<slug>. */
+  uid?: number;
+  /** OPTIONAL, with gatewayAgentToken: the gateway cell-agent of the site's own cell, `https://<lowercase host>`. */
+  gatewayAgentUrl?: string;
+  /** OPTIONAL, with gatewayAgentUrl: that agent's bearer, 64 lowercase hex. A secret: no answer or reason repeats it. */
+  gatewayAgentToken?: string;
 }
 
 // The agency's GCP project id (6-30 chars: lowercase-letter start, [a-z0-9-], alphanumeric end) —
@@ -2870,12 +2893,22 @@ const SSH_PUBLIC_KEY_MAX_LENGTH = 8192;
 // The desired set can be empty (revoke all) up to this ceiling — an account's admins hold a handful
 // of keys, so 50 is generous and stops a junk mega-list.
 const SSH_KEYS_MAX = 50;
+// The largest generation: 15 decimal digits, below 2^53, so it is an exact JSON number on every hop
+// (the gateway script accepts at most 15 digits).
+const SSH_KEYS_GENERATION_MAX = 999_999_999_999_999;
+// The gateway key script's uid range (the storage-tier tenant uids, infra#142).
+const SSH_KEYS_UID_MIN = 100_000;
+const SSH_KEYS_UID_MAX = 9_999_999;
+// The gateway agent's bearer: the same 64-lowercase-hex grammar as every derived cell-agent token.
+const SSH_KEYS_GATEWAY_AGENT_TOKEN_RE = /^[a-f0-9]{64}$/;
+// A URL whose host ends in an all-digit label (an IPv4 literal such as https://10.0.0.5).
+const SSH_KEYS_NUMERIC_LAST_LABEL_RE = /\.[0-9]+$/;
 
 export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<ProvisionSshKeysParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
   }
-  const { project, slug, authorizedKeys } = raw;
+  const { project, slug, authorizedKeys, generation, uid, gatewayAgentUrl, gatewayAgentToken } = raw;
 
   if (typeof project !== "string" || !SSH_KEYS_PROJECT_RE.test(project)) {
     return {
@@ -2911,7 +2944,43 @@ export function validateProvisionSshKeysParams(raw: unknown): ParamsVerdict<Prov
     cleanKeys.push(entry);
   }
 
-  return { ok: true, params: { project, slug, authorizedKeys: cleanKeys } };
+  // Review L-5: required. Absent (undefined) fails the typeof check below like any other bad value.
+  if (
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0 ||
+    generation > SSH_KEYS_GENERATION_MAX
+  ) {
+    return { ok: false, reason: `generation must be an integer 0-${SSH_KEYS_GENERATION_MAX} (required)` };
+  }
+  const params: ProvisionSshKeysParams = { project, slug, authorizedKeys: cleanKeys, generation };
+
+  if (uid !== undefined) {
+    if (typeof uid !== "number" || !Number.isInteger(uid) || uid < SSH_KEYS_UID_MIN || uid > SSH_KEYS_UID_MAX) {
+      return { ok: false, reason: `uid must be an integer ${SSH_KEYS_UID_MIN}-${SSH_KEYS_UID_MAX} when present` };
+    }
+    params.uid = uid;
+  }
+
+  // The gateway agent pair: both or neither. Half a pair is a bug, and a URL must never meet another
+  // source's token. The reasons name the rule only, never the value (the token is a secret).
+  if (gatewayAgentUrl === undefined && gatewayAgentToken === undefined) {
+    return { ok: true, params };
+  }
+  // A cell's agents are reached by their tunnel DNS names. A host whose last label is all digits is an IP
+  // literal, not a name of the cell, so it is refused even though the shared host grammar admits it.
+  if (!isR2FileAgentUrl(gatewayAgentUrl) || SSH_KEYS_NUMERIC_LAST_LABEL_RE.test(gatewayAgentUrl)) {
+    return {
+      ok: false,
+      reason: "gatewayAgentUrl must be exactly https://<lowercase DNS host> (no path, port, query or user part), sent together with gatewayAgentToken",
+    };
+  }
+  if (typeof gatewayAgentToken !== "string" || !SSH_KEYS_GATEWAY_AGENT_TOKEN_RE.test(gatewayAgentToken)) {
+    return { ok: false, reason: "gatewayAgentToken must be 64 lowercase hex characters, sent together with gatewayAgentUrl" };
+  }
+  params.gatewayAgentUrl = gatewayAgentUrl;
+  params.gatewayAgentToken = gatewayAgentToken;
+  return { ok: true, params };
 }
 
 // ── hub#43: agency-owned media — r2-media-buckets, r2-media-state, r2-site-key-install, r2-site-key-revoke ──

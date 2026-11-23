@@ -545,8 +545,10 @@ export type GcpInstanceRestartResult =
 // Deliberately SMALL: the authorized_keys file lives ON the gateway; nothing sensitive comes back.
 // `count` echoes how many key lines the gateway wrote (0 = the set was revoked), so the caller can
 // confirm the whole desired set landed without the Worker re-reading the file.
+// agency-orchestrator#22: `generation` = the gateway wrote THIS push (its echo, checked against the job);
+// `superseded: true` = a newer set was in place and nothing was written. Exactly one of the two is set.
 export type ProvisionSshKeysResult =
-  | { ok: true; op: "provision-ssh-keys"; slug: string; count: number }
+  | { ok: true; op: "provision-ssh-keys"; slug: string; count: number; generation?: number; superseded?: true }
   | { ok: false; op: "provision-ssh-keys"; slug: string; detail: string };
 
 // planning/49 Phase 1 — READ one VM's in-VPC PRIVATE IPv4 (and, planning/47, the non-secret facts of
@@ -4405,77 +4407,166 @@ export async function actuateWpCli(params: WpCliParams, env: Env): Promise<WpCli
 }
 
 // ── provision-ssh-keys ───────────────────────────────────────────────────────────────
-// Declare a cell site's FULL authorized-SSH-key set on the GATEWAY (planning/39 increment 1).
+// Declare a cell site's FULL authorized-SSH-key set on the GATEWAY (planning/39 increment 1). One
+// push covers both logins of the site: the gateway serves the live login `site_<slug>` and the
+// staging login `stg_<slug>` from the same declaration, so there is no second key op for staging.
 // Unlike wp-cli/db-export, this does NOT go through /exec: key material must never be
 // shell-quoted into a command line (a comment could carry a metacharacter, and a key line is
 // exactly the kind of value that belongs in a request BODY, not an argv). It relays to the
 // gateway cell-agent's DEDICATED /provision-ssh-keys endpoint, which hands the JSON straight to
 // the sudoers-whitelisted writer script on STDIN — the same STDIN-JSON convention the SFTP
-// endpoint uses. The Worker sends ONLY {slug, authorizedKeys}: the gateway writes one
-// authorized_keys file per site login and needs no GCP/project data. Uses the agency's OWN
-// CELL_AGENT_TOKEN, never a platform credential.
+// endpoint uses. The Worker sends ONLY {slug, authorizedKeys, generation[, uid]}: the gateway
+// needs no GCP/project data.
 //
-// v1 LIMITATION (shared with wp-cli): CELL_AGENT_URL is SINGLE-CELL and, for THIS op, MUST point
-// at the agency's GATEWAY cell-agent (where the SFTP jails + /etc/ssh/doubleyoup-keys live), not
-// the web node. A multi-node / multi-cell agency needs per-node resolution before this can target
-// more than that one gateway.
+// WHICH GATEWAY (agency-orchestrator#22). The signed job names the gateway cell-agent of the SITE'S
+// OWN cell (gatewayAgentUrl + gatewayAgentToken). The orchestrator resolves the pair from the cell
+// registry (orchestrator#88) and app binds the URL to a gateway host of that cell before it signs,
+// so an agency with several cells writes each site's keys on its own gateway. There is NO fallback:
+// a job without the pair is refused before any call. CELL_AGENT_URL is the WEB node's agent (wp-cli,
+// db-export, db-import), and a key push sent there could never reach the gateway that serves the
+// logins. A single Worker-wide gateway secret would only move the one-cell limit to another variable.
+//
+// GENERATION FENCING. The gateway script refuses a push older than the one it last wrote, and it
+// answers either `generation: N` (it WROTE this push's set) or `superseded: true` (a newer set is in
+// place; nothing written). The Worker relays `generation` and checks the answer: ok:true only for an
+// echo equal to this push's number and a count equal to the set it sent, or for `superseded`, which
+// app reads as "not confirmed". A reply without an echo (a gateway older than the fence), a different
+// echo, or an answer that has both is ok:false: it never reads as a confirmed revocation.
 
 // A small reply is expected (a status object); cap the buffered body so a misconfigured endpoint
 // can never make the Worker OOM (same reasoning as WP_CLI_RESPONSE_MAX_BYTES).
 const SSH_KEYS_RESPONSE_MAX_BYTES = 64 * 1024;
+// The gateway's error text is relayed in the detail, capped so a chatty agent cannot bloat the answer.
+const SSH_KEYS_ERROR_DETAIL_MAX_CHARS = 300;
+// The most key lines a declaration can hold (the validator's cap; the gateway agent enforces it too).
+const SSH_KEYS_COUNT_MAX = 50;
 
 function provisionSshKeysFailure(slug: string, detail: string): ProvisionSshKeysResult {
   return { ok: false, op: "provision-ssh-keys", slug, detail };
 }
 
+/** The fields of the gateway's /provision-ssh-keys answer this actuator reads. */
+interface GatewaySshKeysReply {
+  ok?: unknown;
+  slug?: unknown;
+  count?: unknown;
+  generation?: unknown;
+  superseded?: unknown;
+  error?: unknown;
+}
+
 /**
- * Write the FULL authorized-key set for `params.slug` on the agency's GATEWAY via the cell-agent's
- * /provision-ssh-keys endpoint, using the agency's OWN CELL_AGENT_TOKEN. Idempotent (declare-the-
- * whole-set): a re-run converges on the same file. Returns a structured result; a cell-agent-side
- * failure is ok:false + detail (the route still answers HTTP 200 so the orchestrator classifies it),
- * never a thrown 500.
+ * Check the gateway's 200 answer against the push it answers. Returns the Worker's result: ok:true only
+ * for a confirmed write of THIS push (or a `superseded` answer, passed through for app to read as not
+ * confirmed), ok:false for every answer that does not prove either.
+ */
+function provisionSshKeysOutcome(params: ProvisionSshKeysParams, reply: GatewaySshKeysReply): ProvisionSshKeysResult {
+  const slug = params.slug;
+  if (reply.ok !== true) {
+    return provisionSshKeysFailure(slug, "the gateway cell-agent /provision-ssh-keys did not answer ok:true.");
+  }
+  if (reply.slug !== slug) {
+    return provisionSshKeysFailure(slug, "the gateway cell-agent /provision-ssh-keys answered for another site.");
+  }
+  const count = reply.count;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0 || count > SSH_KEYS_COUNT_MAX) {
+    return provisionSshKeysFailure(slug, "the gateway cell-agent /provision-ssh-keys answered without a valid key count.");
+  }
+
+  const hasGeneration = reply.generation !== undefined;
+  if (reply.superseded === true) {
+    if (hasGeneration) {
+      // The gateway never sends both: an answer that does is not one this actuator understands.
+      return provisionSshKeysFailure(slug, "the gateway answered both superseded and a generation, which is not a valid confirmation.");
+    }
+    // A newer set is already in place and nothing was written. Passed through as it is: app counts it
+    // as NOT confirmed, because the newer write may have failed half-way.
+    return { ok: true, op: "provision-ssh-keys", slug, count, superseded: true };
+  }
+  if (reply.superseded !== undefined) {
+    return provisionSshKeysFailure(slug, "the gateway answered an invalid superseded flag.");
+  }
+  if (!hasGeneration) {
+    return provisionSshKeysFailure(
+      slug,
+      `the gateway did not confirm which push it wrote (no generation echo; its cell-agent predates the generation fence), so push ${params.generation} is not confirmed.`,
+    );
+  }
+  if (reply.generation !== params.generation) {
+    const echoed = String(reply.generation).slice(0, 20);
+    return provisionSshKeysFailure(slug, `the gateway confirmed push ${echoed}, not this push (${params.generation}).`);
+  }
+  if (count !== params.authorizedKeys.length) {
+    return provisionSshKeysFailure(
+      slug,
+      `the gateway confirmed push ${params.generation} with ${count} key lines, but the declared set has ${params.authorizedKeys.length}.`,
+    );
+  }
+  return { ok: true, op: "provision-ssh-keys", slug, count, generation: params.generation };
+}
+
+/**
+ * Write the FULL authorized-key set for `params.slug` on the gateway the signed job names, via its
+ * cell-agent's /provision-ssh-keys endpoint. Idempotent (declare-the-whole-set): a re-run converges on
+ * the same file. Returns a structured result; a cell-agent-side failure is ok:false + detail (the route
+ * still answers HTTP 200 so the orchestrator classifies it), never a thrown 500. No detail ever repeats
+ * the gateway token.
  */
 export async function actuateProvisionSshKeys(
   params: ProvisionSshKeysParams,
-  env: Env,
 ): Promise<ProvisionSshKeysResult> {
-  const cellAgentUrl = env.CELL_AGENT_URL;
-  const cellAgentToken = env.CELL_AGENT_TOKEN;
-  if (!cellAgentUrl || !cellAgentToken) {
-    return provisionSshKeysFailure(params.slug, "CELL_AGENT_URL / CELL_AGENT_TOKEN are not configured on this Worker.");
+  const gatewayAgentUrl = params.gatewayAgentUrl;
+  const gatewayAgentToken = params.gatewayAgentToken;
+  if (!gatewayAgentUrl || !gatewayAgentToken) {
+    // No web-target fallback: CELL_AGENT_URL is the web node, which serves no SSH login.
+    return provisionSshKeysFailure(
+      params.slug,
+      "the signed job names no gateway cell-agent (gatewayAgentUrl / gatewayAgentToken), so the site's gateway is unknown; nothing was sent. The platform must sign the gateway of the site's own cell.",
+    );
   }
 
   // The exact request shape the gateway cell-agent's /provision-ssh-keys endpoint accepts
   // (infra/cell-agent/agent.php): POST, Authorization: Bearer <token>, JSON body { slug,
-  // authorizedKeys }. It answers HTTP 200 { ok, slug, count } on success and a non-2xx on failure.
+  // authorizedKeys, generation[, uid] }. It answers HTTP 200 { ok, slug, count, generation |
+  // superseded } on success and a non-2xx on failure.
+  const requestBody: { slug: string; authorizedKeys: string[]; generation: number; uid?: number } = {
+    slug: params.slug,
+    authorizedKeys: params.authorizedKeys,
+    generation: params.generation,
+  };
+  if (params.uid !== undefined) {
+    requestBody.uid = params.uid;
+  }
+
   let response: Response;
   try {
-    response = await fetch(stripTrailingSlash(cellAgentUrl) + "/provision-ssh-keys", {
+    response = await fetch(stripTrailingSlash(gatewayAgentUrl) + "/provision-ssh-keys", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${cellAgentToken}`,
+        authorization: `Bearer ${gatewayAgentToken}`,
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({ slug: params.slug, authorizedKeys: params.authorizedKeys }),
+      body: JSON.stringify(requestBody),
       // "manual", not "error": workerd rejects redirect:"error" at runtime. We still refuse to
-      // FOLLOW a redirect (a signed job must reach the configured gateway agent, not be bounced
-      // elsewhere) — a redirect surfaces below as a fail-closed error.
+      // FOLLOW a redirect (a signed job must reach the named gateway agent, and following would
+      // hand the bearer to another host) — a redirect surfaces below as a fail-closed error.
       redirect: "manual",
     });
   } catch (err) {
-    return provisionSshKeysFailure(params.slug, `could not reach the cell-agent /provision-ssh-keys: ${errorMessage(err)}`);
+    // AMBIGUOUS: the request may have reached the gateway. ok:false is the safe side for a removal.
+    return provisionSshKeysFailure(params.slug, `could not read the answer of the gateway cell-agent /provision-ssh-keys: ${errorMessage(err)}`);
   }
 
   // The cell-agent should never 3xx (status 0 is workerd's opaqueredirect). Treat either as
-  // fail-closed rather than following it: a redirect means a misconfigured CELL_AGENT_URL.
+  // fail-closed rather than following it: a redirect means a wrong gateway URL.
   if (response.status === 0 || (response.status >= 300 && response.status < 400)) {
     await response.body?.cancel().catch(() => {});
-    return provisionSshKeysFailure(params.slug, `cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.`);
+    return provisionSshKeysFailure(params.slug, `the gateway cell-agent redirected unexpectedly (HTTP ${response.status}) — refusing to follow.`);
   }
   if (response.status === 401 || response.status === 403) {
     await response.body?.cancel().catch(() => {});
-    return provisionSshKeysFailure(params.slug, "the cell-agent rejected CELL_AGENT_TOKEN (bearer auth failed).");
+    return provisionSshKeysFailure(params.slug, "the gateway cell-agent rejected the gatewayAgentToken of the signed job (bearer auth failed).");
   }
 
   const read = await readBodyCapped(response, SSH_KEYS_RESPONSE_MAX_BYTES);
@@ -4484,21 +4575,25 @@ export async function actuateProvisionSshKeys(
   }
 
   // Only NOW parse the bounded text. A non-JSON reply is a cell-agent-side error.
-  let body: { ok?: boolean; count?: number; error?: string } | null;
+  let body: GatewaySshKeysReply | null;
   try {
-    body = JSON.parse(read.text) as { ok?: boolean; count?: number; error?: string };
+    body = JSON.parse(read.text) as GatewaySshKeysReply;
   } catch {
     body = null;
   }
-
-  if (!response.ok || !body || body.ok !== true) {
-    const detail = body?.error ? `: ${body.error}` : "";
-    return provisionSshKeysFailure(params.slug, `cell-agent /provision-ssh-keys failed with HTTP ${response.status}${detail}.`);
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return provisionSshKeysFailure(params.slug, `the gateway cell-agent /provision-ssh-keys answered HTTP ${response.status} with a body that is not a JSON object.`);
   }
 
-  // Prefer the count the gateway actually wrote; fall back to the set we sent.
-  const count = typeof body.count === "number" ? body.count : params.authorizedKeys.length;
-  return { ok: true, op: "provision-ssh-keys", slug: params.slug, count };
+  if (!response.ok) {
+    let detail = "";
+    if (typeof body.error === "string") {
+      detail = `: ${body.error.slice(0, SSH_KEYS_ERROR_DETAIL_MAX_CHARS)}`;
+    }
+    return provisionSshKeysFailure(params.slug, `the gateway cell-agent /provision-ssh-keys failed with HTTP ${response.status}${detail}.`);
+  }
+
+  return provisionSshKeysOutcome(params, body);
 }
 
 // ── db-export ──────────────────────────────────────────────────────────────────────────

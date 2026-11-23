@@ -147,6 +147,10 @@ export interface Env {
   // v1 LIMITATION: single-cell (one agency cell). A multi-cell agency needs
   // per-cell resolution (a cell selector + a map of URL/token pairs) before
   // these ops can target more than one cell.
+  //
+  // agency-orchestrator#22: `provision-ssh-keys` does NOT use this pair. Its signed job names the
+  // gateway cell-agent of the site's own cell (gatewayAgentUrl + gatewayAgentToken), and a job
+  // without that pair is refused, never sent here: this is the web node, which serves no SSH login.
   CELL_AGENT_URL?: string;
   CELL_AGENT_TOKEN?: string;
   // hub#43: the agency's FILE-NODE cell-agent (where /set-r2-target runs). The r2-site-key-install op posts

@@ -49,10 +49,39 @@ Worker never persists them anywhere else and we never hold them. See
 | `DY_WORKER_NAME` | secret | this Worker's own script name, as the Cloudflare dashboard shows it (e.g. `my-agency-orchestrator`). It can differ from `name` in your fork's `wrangler.toml`. The `edge-gate-deploy` op binds your cell's session gate to this Worker's `SessionGateMinter` entrypoint by this name, and refuses while it is unset. Not secret, but set it as a secret so a redeploy keeps it. `/validate` reports whether it is set (`cfDns.workersScope.workerName`) |
 | `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | secrets | AI provider keys — set at least one (`OPENAI_API_KEY` also covers Codex) |
 | `DY_SIGNING_PUBLIC_KEY` | secret | your account's ed25519 public key (SPKI PEM) from onboarding. `/actuate` checks each job with it. Unset, `/actuate` refuses every job |
-| `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your cell-agent base URL and bearer token. The `wp-cli`, `db-export` and `db-import` ops post to its `/exec` endpoint. The `provision-ssh-keys` op posts to its `/provision-ssh-keys` endpoint and needs the **gateway** cell-agent, not the web node. All four ops share this one pair, and it serves one cell only: on a cell where the web node and the gateway are separate machines, the pair reaches only one of them |
+| `CELL_AGENT_URL` / `CELL_AGENT_TOKEN` | secrets | your **web-node** cell-agent base URL and bearer token. The `wp-cli`, `db-export` and `db-import` ops post to its `/exec` endpoint. The pair serves one cell only. `provision-ssh-keys` does not use it: see [SSH keys](#ssh-keys-provision-ssh-keys) |
 | `CELL_FILE_AGENT_URL` / `CELL_FILE_AGENT_TOKEN` | secrets (optional) | a fallback file-node agent for `r2-site-key-install`. A current job names its own agent, and the job's pair wins, so most agencies do not set them. Set both or neither |
 | `R2_EXPECTED_ACCOUNT_ID` | var (optional) | the Cloudflare account id that `R2_PROVISION_API_TOKEN` must belong to. When set, the `r2-media-*` and `r2-site-key-*` ops refuse any other account |
 | `MEDIA_SITE_SECRET` | secret | hub#222: at least 32 characters (for example `openssl rand -hex 32`). The root of every site's media credential for `POST /media/*`, see [Media soft delete](#media-soft-delete). Changing it invalidates every site's credential until `media-site-credential-install` runs again |
+
+## SSH keys (`provision-ssh-keys`)
+
+One `provision-ssh-keys` job declares the **full** key set of one site. The site's gateway serves both
+logins from that one declaration: the live login `site_<slug>` and the staging login `stg_<slug>`. There
+is no separate staging key op. An empty set revokes every key.
+
+**Which gateway.** The signed job names the gateway cell-agent of the site's own cell: `gatewayAgentUrl`
+(exactly `https://<lowercase host>`, no IP literal) and `gatewayAgentToken` (64 lowercase hex). The
+orchestrator reads both from its cell registry (orchestrator#88), and app checks that the URL is a gateway
+host of the site's own cell before it signs. So an agency with several cells needs **no Worker secret and
+no manual step per cell or per site** for SSH keys. The Worker posts the keys only to the pair in the job:
+a job without the pair is refused with no call, and it never falls back to `CELL_AGENT_URL` (the web
+node). A redirect is refused, the reply is read up to 64 KiB, and no answer or detail repeats the token.
+
+**Generation fence.** The job carries app's push number, `generation` (required). The Worker relays
+`{slug, authorizedKeys, generation, uid?}` to the gateway's `/provision-ssh-keys`. Its answer:
+
+- `{ok: true, slug, count, generation}`: the gateway wrote this push. The Worker returns this only when
+  the gateway's echo equals the job's `generation` and `count` equals the size of the set.
+- `{ok: true, slug, count, superseded: true}`: a newer set was already in place and nothing was written.
+  app reads this as not confirmed.
+- `{ok: false, detail}`: everything else, including a gateway that answers without an echo (older than
+  the fence) or with another push's number. A revocation is never reported as done without the echo.
+
+**Deployment prerequisites.** The gateway must run a cell bundle whose cell-agent echoes `generation`
+(infra#142 / orchestrator#88). The orchestrator must sign the gateway pair (orchestrator#88) and app must
+accept and bind it (app#239). Until app signs the pair, every key push from that app fails closed with
+"names no gateway cell-agent" instead of reaching the wrong node.
 
 ## Where setup instructions live
 
