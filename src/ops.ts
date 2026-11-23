@@ -511,7 +511,7 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   }),
   "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
     validateParams: validateProvisionSshKeysParams,
-    actuate: (params, env) => actuateProvisionSshKeys(params, env),
+    actuate: (params) => actuateProvisionSshKeys(params),
   }),
   "gcp-instance-get": defineOp<GcpInstanceGetParams>({
     validateParams: validateGcpInstanceGetParams,
