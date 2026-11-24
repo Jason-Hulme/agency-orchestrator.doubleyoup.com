@@ -281,7 +281,16 @@ const CACHE_PURGE_URL_MAX_LENGTH = 2048;
  * Modelled as a discriminated union on `mode` so exactly one selector is present:
  *   - everything: whole-zone purge, no list;
  *   - files: 1..30 absolute https URLs, each within `zone`;
- *   - hosts: 1..30 lowercase hostnames, each within `zone`.
+ *   - hosts: 1..30 lowercase hostnames. Each is either within `zone`, or a bare custom-hostname
+ *     FQDN (a customer domain onboarded onto the agency zone as a Cloudflare-for-SaaS custom
+ *     hostname, e.g. "www.customer.example"). Only a purge in the SaaS zone evicts the cache of a
+ *     custom hostname, so the zone is still `zone`; the host just is not under it by name.
+ *
+ * Trust for a host OUTSIDE the zone: this Worker has no database, so it checks only the grammar.
+ * The trust check is the app's binding check (the host must be a live Domain row of a site on one
+ * of the account's cells in that zone) before it signs the job. The Worker's own token pin keeps
+ * the purge in the agency's own zone (resolveZoneId finds `zone` only if the token can see it),
+ * and a purge only evicts cache. Modes "files" and "everything" are unchanged: they stay in zone.
  */
 export type CachePurgeParams =
   | { zone: string; mode: "everything" }
@@ -317,9 +326,14 @@ function isValidCachePurgeFileUrl(entry: unknown, zone: string): boolean {
 }
 
 /**
- * True when `entry` is a bare lowercase hostname (no scheme, no wildcard) within `zone`.
- * Reuses the DNS zone grammar (lowercase, 2+ labels), matching the DNS op's "callers
- * normalize before signing" rule rather than normalizing here.
+ * True when `entry` is a bare lowercase hostname (no scheme, no wildcard) that is either within
+ * `zone` or a custom-hostname FQDN. Same rule body as the app's isValidCachePurgeHostname.
+ *
+ * - Within the zone: the DNS zone grammar (lowercase, 2+ labels), matching the DNS op's "callers
+ *   normalize before signing" rule rather than normalizing here.
+ * - Outside the zone: the custom-hostname grammar (isCustomHostnameFqdn), the same one the
+ *   custom-hostname ops use: lowercase, 2+ labels, no scheme, no wildcard, no trailing dot, at
+ *   most 253 characters, and not an IP literal.
  */
 function isValidCachePurgeHostname(entry: unknown, zone: string): boolean {
   if (
@@ -330,8 +344,11 @@ function isValidCachePurgeHostname(entry: unknown, zone: string): boolean {
   ) {
     return false;
   }
-  if (!DNS_ZONE_RE.test(entry)) return false;
-  return entry === zone || entry.endsWith(`.${zone}`);
+  const isInZone = entry === zone || entry.endsWith(`.${zone}`);
+  if (isInZone) {
+    return DNS_ZONE_RE.test(entry);
+  }
+  return isCustomHostnameFqdn(entry);
 }
 
 export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurgeParams> {
@@ -376,7 +393,8 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
     return { ok: true, params: { zone, mode: "files", files: cleanFiles } };
   }
 
-  // hosts: 1..30 lowercase hostnames within the zone; the files list must be absent.
+  // hosts: 1..30 lowercase hostnames (in the zone, or a customer-domain custom hostname); the
+  // files list must be absent.
   if (mode === "hosts") {
     if (files !== undefined) {
       return { ok: false, reason: 'mode "hosts" must not carry a files list' };
@@ -387,7 +405,7 @@ export function validateCachePurgeParams(raw: unknown): ParamsVerdict<CachePurge
     const cleanHosts: string[] = [];
     for (const entry of hosts) {
       if (!isValidCachePurgeHostname(entry, zone)) {
-        return { ok: false, reason: "each hosts entry must be a lowercase hostname within zone" };
+        return { ok: false, reason: "each hosts entry must be a lowercase hostname within zone or a custom-hostname FQDN" };
       }
       cleanHosts.push(entry as string);
     }

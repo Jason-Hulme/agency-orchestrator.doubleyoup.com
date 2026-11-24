@@ -1358,8 +1358,41 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ mode: "hosts", hosts: ["Doubleyoup.com"] }).ok).toBe(false); // uppercase
     expect(bad({ mode: "hosts", hosts: ["https://doubleyoup.com/x"] }).ok).toBe(false); // URL, not a hostname
     expect(bad({ mode: "hosts", hosts: ["*.doubleyoup.com"] }).ok).toBe(false); // wildcard
-    expect(bad({ mode: "hosts", hosts: ["evil.com"] }).ok).toBe(false); // out of zone
-    expect(bad({ mode: "hosts", hosts: ["notdoubleyoup.com"] }).ok).toBe(false); // suffix trick
+    expect(bad({ mode: "hosts", hosts: ["https://www.customer.example"] }).ok).toBe(false); // scheme
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example."] }).ok).toBe(false); // trailing dot
+    expect(bad({ mode: "hosts", hosts: ["*.customer.example"] }).ok).toBe(false); // wildcard, outside the zone
+    expect(bad({ mode: "hosts", hosts: ["WWW.customer.example"] }).ok).toBe(false); // uppercase, outside the zone
+    expect(bad({ mode: "hosts", hosts: ["customer"] }).ok).toBe(false); // single label
+    expect(bad({ mode: "hosts", hosts: ["192.0.2.1"] }).ok).toBe(false); // IPv4 literal
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example/path"] }).ok).toBe(false); // path
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example:8443"] }).ok).toBe(false); // port
+    expect(bad({ mode: "hosts", hosts: [" www.customer.example"] }).ok).toBe(false); // padded
+    expect(bad({ mode: "hosts", hosts: ["under_score.customer.example"] }).ok).toBe(false); // not a host name
+    expect(bad({ mode: "hosts", hosts: [`${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(60)}.${"e".repeat(60)}.example`] }).ok).toBe(false); // over 253
+    // one bad entry refuses the whole list, even next to valid ones
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example", "*.customer.example"] }).ok).toBe(false);
+  });
+
+  it("cache-purge: mode hosts accepts a customer domain outside the zone, and keeps the entries unchanged", () => {
+    const hosts = ["www.customer.example", "customer.example", "site-production.doubleyoup.com"];
+    expect(validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts })).toEqual({
+      ok: true,
+      params: { zone: "doubleyoup.com", mode: "hosts", hosts },
+    });
+    // The params carry a fresh array, not the caller's.
+    const verdict = validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts });
+    expect(verdict.ok && verdict.params.mode === "hosts" && verdict.params.hosts !== hosts).toBe(true);
+    // A list of exactly 30 customer domains is the cap, and passes.
+    const thirty = Array.from({ length: 30 }, (_, index) => `www${index}.customer.example`);
+    expect(validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts: thirty }).ok).toBe(true);
+  });
+
+  it("cache-purge: mode files and mode everything still refuse a URL or host outside the zone", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateCachePurgeParams({ zone: "doubleyoup.com", mode: "everything", ...overrides });
+    expect(bad({ mode: "files", files: ["https://www.customer.example/x"] }).ok).toBe(false);
+    expect(bad({ mode: "files", files: ["https://doubleyoup.com/x", "https://www.customer.example/x"] }).ok).toBe(false);
+    expect(bad({ mode: "everything", hosts: ["www.customer.example"] }).ok).toBe(false);
   });
 
   // ── cache-rule-upsert (twin of the app's rules) ───────────────────────────────────
@@ -5410,6 +5443,21 @@ describe("POST /actuate route", () => {
     expect(body.ok).toBe(true);
     expect(body.count).toBe(2);
     expect(calls.find((c) => c.method === "POST")?.body).toEqual({ hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] });
+  });
+
+  it("cache-purge: hosts mode sends a customer domain (outside the zone) to the zone's purge_cache unchanged", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const hosts = ["www.customer.example", "customer.example", "site-production.doubleyoup.com"];
+    const job = cachePurgeJob({ params: JSON.stringify({ zone: "doubleyoup.com", mode: "hosts", hosts }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCachePurgeApi();
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; count: number };
+    expect(body.ok).toBe(true);
+    expect(body.count).toBe(3);
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ hosts });
   });
 
   it("cache-purge: fails cleanly when the token cannot see the zone (no purge)", async () => {

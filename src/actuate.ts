@@ -1854,6 +1854,15 @@ export async function actuateCfTunnelDelete(params: CfTunnelDeleteParams, env: E
 // No new onboarding validator: like the DNS edit scope, the Cache Purge scope is exercised
 // for real on the FIRST purge, which reports a clear denial (401/403) if it is missing.
 //
+// Mode "hosts" may name a customer domain: a Cloudflare-for-SaaS custom hostname in the agency
+// zone that is not under the zone by name. Only a purge in that zone evicts its cache (Cloudflare
+// docs: Cloudflare for SaaS > Troubleshooting > "Purge cache": purge the cache by hostname with
+// the custom hostnames). The trust check for such a host is the app's binding check (a live Domain
+// row of a site on one of the account's cells in that zone); this Worker has no database and
+// checks only the grammar (dispatch-params.ts). The token pin keeps the purge in the agency's own
+// zone: resolveZoneId finds `zone` only if this agency's token can see it, and the POST goes to
+// that zone's purge_cache, so a purge can never reach another account's cache.
+//
 // A cache purge is idempotent and safe to repeat, so the F1 replay-nonce note (handleActuate
 // burns the nonce before actuating) does not bite here: a retry means re-signing a fresh job,
 // and re-running a purge just re-evicts already-evicted content — zero additional effect.
