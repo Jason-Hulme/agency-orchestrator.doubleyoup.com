@@ -1,6 +1,6 @@
 // hub#222 — the SITE-FACING media API (agency Worker side).
 //
-// The site's mu-plugin holds no R2 key. It calls these four routes with its per-site credential instead, and the
+// The site's mu-plugin holds no R2 key. It calls these five routes with its per-site credential instead, and the
 // Worker is the only party that deletes or replaces an object:
 //
 //   POST /media/sign-put   {bucket, key, contentType, contentLength}  -> a presigned create-once PUT for one new key
@@ -8,11 +8,14 @@
 //   POST /media/delete     {bucket, key}                              -> current object to trash, then deleted
 //   POST /media/rename     {bucket, from, to}                         -> `from` copied to `to` (create-once), `from` to
 //                                                                        trash, `from` deleted
+//   POST /media/list       {bucket, prefix, cursor?, startAfter?, maxKeys?}
+//                                                                     -> READ one page of live keys and sizes under
+//                                                                        `prefix` (hub#588). No lease, no write.
 //
 // AUTH. `Authorization: Bearer <credential>`, where credential = hex(HMAC-SHA256(MEDIA_SITE_SECRET, bucket)). The
 // site gets it as DOUBLEYOUP_MEDIA_SITE_TOKEN (media-site-credential-install writes it), next to its bucket
 // (DOUBLEYOUP_R2_BUCKET). The check is crypto.subtle.verify, which compares in constant time. This is NOT
-// Direction-B: no platform signature, no nonce. A credential opens exactly one bucket, and only these four routes.
+// Direction-B: no platform signature, no nonce. A credential opens exactly one bucket, and only these five routes.
 //
 // RATE LIMIT. 600 authenticated requests per minute per bucket (MEDIA_SITE_RATE_LIMIT_PER_MINUTE), counted in a
 // Durable Object instance of that bucket only (`media-rate:<bucket>`), so no site shares a counter or a lock with
@@ -45,13 +48,19 @@
 import type { Env } from "./env.js";
 import {
   isMediaBucketForSite,
+  mediaBucketSitePrefix,
   mediaLiveKeyViolation,
   mediaUploadViolation,
+  MEDIA_BULK_CREDENTIAL_MIN_TTL_SECONDS,
+  MEDIA_KEY_MAX_BYTES,
+  MEDIA_TRASH_PREFIX,
+  validateMediaBulkCredentialParams,
 } from "./dispatch-params-media.js";
 import {
   copyMediaObject,
   deleteMediaObject,
   headMediaObject,
+  listMediaObjects,
   mediaRevisionId,
   mediaStoreIdentity,
   moveToTrash,
@@ -91,7 +100,14 @@ const MEDIA_REQUEST_MAX_BYTES = 16 * 1024;
 const CREDENTIAL_HEX_RE = /^[a-f0-9]{64}$/;
 const BEARER_PREFIX = "Bearer ";
 
-export const MEDIA_SITE_ACTIONS = ["sign-put", "replace", "delete", "rename"] as const;
+/** The largest /media/list page, and its default: R2's own ListObjectsV2 maximum. */
+export const MEDIA_LIST_MAX_KEYS = 1000;
+// The same cursor rule as media-trash-list (dispatch-params-media.ts, MEDIA_CURSOR_RE and its length cap). Repeated
+// here because that file is a pinned twin with app and exports neither.
+const MEDIA_LIST_CURSOR_MAX_LENGTH = 1024;
+const MEDIA_LIST_CURSOR_RE = /^[!-~]+$/;
+
+export const MEDIA_SITE_ACTIONS = ["sign-put", "replace", "delete", "rename", "list"] as const;
 export type MediaSiteAction = (typeof MEDIA_SITE_ACTIONS)[number];
 
 export function isMediaSiteAction(value: string): value is MediaSiteAction {
@@ -185,6 +201,7 @@ const ALLOWED_FIELDS: Record<MediaSiteAction, readonly string[]> = {
   replace: ["bucket", "key", "contentType", "contentLength"],
   delete: ["bucket", "key"],
   rename: ["bucket", "from", "to"],
+  list: ["bucket", "prefix", "cursor", "startAfter", "maxKeys"],
 };
 
 function unknownFieldReason(body: Record<string, unknown>, action: MediaSiteAction): string | null {
@@ -533,6 +550,111 @@ async function renameTargetState(
   return "other";
 }
 
+interface MediaListRequest {
+  prefix: string;
+  cursor?: string;
+  startAfter?: string;
+  maxKeys: number;
+}
+
+function hasControlCharacter(text: string): boolean {
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The checked /media/list body, or the reason it is refused (400). */
+function parseMediaListRequest(bucket: string, body: Record<string, unknown>): MediaListRequest | { error: string } {
+  // The prefix follows exactly the media-bulk-credential prefix rule: `<site prefix>/` or a folder under it, ending
+  // in "/", the path rules, the byte limit, never `<site prefix>/trash/`. Its validator is reused (with a valid ttl)
+  // so the two rules cannot drift apart. `trash/` itself is outside `<site prefix>/`, so it is refused too.
+  const prefixVerdict = validateMediaBulkCredentialParams({
+    bucket,
+    prefix: body.prefix,
+    ttlSeconds: MEDIA_BULK_CREDENTIAL_MIN_TTL_SECONDS,
+  });
+  if (!prefixVerdict.ok) {
+    return { error: prefixVerdict.reason };
+  }
+  const request: MediaListRequest = { prefix: prefixVerdict.params.prefix, maxKeys: MEDIA_LIST_MAX_KEYS };
+
+  if (body.cursor !== undefined) {
+    const cursor = body.cursor;
+    if (typeof cursor !== "string" || cursor.length > MEDIA_LIST_CURSOR_MAX_LENGTH || !MEDIA_LIST_CURSOR_RE.test(cursor)) {
+      return { error: "cursor must be the nextCursor a previous /media/list page returned" };
+    }
+    request.cursor = cursor;
+  }
+
+  if (body.startAfter !== undefined) {
+    const startAfter = body.startAfter;
+    const sitePrefix = `${mediaBucketSitePrefix(bucket)}/`;
+    if (typeof startAfter !== "string" || !startAfter.startsWith(sitePrefix)) {
+      return { error: `startAfter must be a key under the site's prefix ${sitePrefix}` };
+    }
+    if (new TextEncoder().encode(startAfter).byteLength > MEDIA_KEY_MAX_BYTES) {
+      return { error: `startAfter must be at most ${MEDIA_KEY_MAX_BYTES} bytes` };
+    }
+    if (hasControlCharacter(startAfter)) {
+      return { error: "startAfter must not contain a control character" };
+    }
+    request.startAfter = startAfter;
+  }
+
+  if (body.maxKeys !== undefined) {
+    const maxKeys = body.maxKeys;
+    if (typeof maxKeys !== "number" || !Number.isInteger(maxKeys) || maxKeys < 1 || maxKeys > MEDIA_LIST_MAX_KEYS) {
+      return { error: `maxKeys must be a whole number from 1 to ${MEDIA_LIST_MAX_KEYS}` };
+    }
+    request.maxKeys = maxKeys;
+  }
+  return request;
+}
+
+/**
+ * True when a listed key may go back to the site: under the requested prefix, and neither under `trash/` nor under
+ * `<site prefix>/trash/`. The prefix rule already keeps R2 from listing those; this guards the answer itself, and it
+ * also drops `<site prefix>/trash/` keys that a listing of the whole site prefix would include.
+ */
+function isListableLiveKey(bucket: string, prefix: string, key: string): boolean {
+  if (key.startsWith(MEDIA_TRASH_PREFIX)) {
+    return false;
+  }
+  if (!key.startsWith(prefix)) {
+    return false;
+  }
+  const sitePrefix = `${mediaBucketSitePrefix(bucket)}/`;
+  if (key.slice(sitePrefix.length).startsWith(MEDIA_TRASH_PREFIX)) {
+    return false;
+  }
+  return true;
+}
+
+/** POST /media/list: one read-only page of the site's live keys. No lease: nothing is changed. */
+async function handleList(identity: MediaStoreIdentity, bucket: string, body: Record<string, unknown>): Promise<Response> {
+  const parsed = parseMediaListRequest(bucket, body);
+  if ("error" in parsed) {
+    return refuse(400, parsed.error);
+  }
+  const page = await listMediaObjects(identity, bucket, parsed.prefix, parsed.maxKeys, parsed.cursor, parsed.startAfter);
+  if ("error" in page) {
+    // The error names the prefix and the HTTP status only: never the signed URL or the credential.
+    return refuse(502, page.error);
+  }
+  const entries: Array<{ key: string; size: number | null }> = [];
+  for (const entry of page.entries) {
+    if (!isListableLiveKey(bucket, parsed.prefix, entry.key)) {
+      continue;
+    }
+    entries.push({ key: entry.key, size: entry.size });
+  }
+  return json({ ok: true, action: "list", entries, nextCursor: page.nextCursor }, 200);
+}
+
 /** POST /media/<action>. The router calls this only for a POST with a known action. */
 export async function handleMediaSiteRequest(request: Request, env: Env, action: MediaSiteAction): Promise<Response> {
   const secret = configuredMediaSiteSecret(env);
@@ -575,6 +697,9 @@ export async function handleMediaSiteRequest(request: Request, env: Env, action:
   const identity = await mediaStoreIdentity(env);
   if ("error" in identity) {
     return refuse(503, identity.error);
+  }
+  if (action === "list") {
+    return handleList(identity, bucket, body);
   }
   const nowMs = Date.now();
   if (action === "sign-put") {
