@@ -275,9 +275,9 @@ const SYD_LIVE_LOGIN_GATE_EXPRESSION =
   '(http.request.uri.path eq "/wp-login.php") or (starts_with(http.request.uri.path, "/wp-admin/") and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") and not (http.cookie contains "wordpress_logged_in_"))';
 const SYD_LIVE_COUNTRY_BLOCK_EXPRESSION = 'ip.geoip.country in {"RU" "CN" "KP"}';
 const SYD_LIVE_WPADMIN_GEO_EXPRESSION =
-  '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
+  '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"})';
 const SYD_LIVE_FRONTEND_GEO_EXPRESSION =
-  'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"}) and not (cf.verified_bot_category eq "Search Engine Crawler") and not (http.host in {"app.doubleyoup.com" "status.doubleyoup.com" "media.doubleyoup.com" "host.doubleyoup.com" "cell-syd.doubleyoup.com"})';
+  'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"}) and not (cf.verified_bot_category eq "Search Engine Crawler") and not (http.host in {"app.doubleyoup.com" "status.doubleyoup.com" "media.doubleyoup.com" "host.doubleyoup.com" "cell-syd.doubleyoup.com"})';
 const SYD_LIVE_EXEC_SKIP_EXPRESSION =
   '(http.host eq "cell-syd.doubleyoup.com" and starts_with(http.request.uri.path, "/exec"))';
 const SYD_LIVE_EXEC_SKIP_DESCRIPTION = "skip managed WAF for cell-agent exec (internal bearer-authed endpoint)";
@@ -290,7 +290,7 @@ const EXPECTED_SYD_AGENT_SKIP_EXPRESSION = '(http.host in {"cell-syd.doubleyoup.
 const EXPECTED_WPADMIN_GEO_EXPRESSION =
   '(starts_with(http.request.uri.path, "/wp-admin") or http.request.uri.path eq "/wp-login.php") ' +
   'and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") ' +
-  'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
+  'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"})';
 
 // A wp-cli job — a SAFE read-only command (option get siteurl) by default.
 const WP_CLI_PARAMS = {
@@ -1584,7 +1584,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
 
   // The front-end rule for WAF_RULE_PARAMS (example.com, two excluded hosts).
   const EXPECTED_FRONTEND_GEO_EXPRESSION =
-    'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"}) ' +
+    'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"}) ' +
     'and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
     'and not (http.host in {"cell-x.example.com" "host.example.com"}) ' +
     'and not ends_with(http.host, "-media.example.com")';
@@ -1707,7 +1707,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   it("waf-rule-upsert: the expression helpers normalize codes and REFUSE an empty set", () => {
     expect(wafCountryBlockExpression(["RU", "CN", "KP"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
     expect(wafCountryBlockExpression([" ru ", "cn", "RU", "kp"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
-    expect(wafWpAdminGeoExpression(["AU", "US", "GB", "NZ", "FR", "IE"])).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
+    expect(wafWpAdminGeoExpression(["AU", "US", "GB", "NZ", "FR", "IE", "TH"])).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
     expect(wafLoginGateExpression()).toBe(EXPECTED_LOGIN_GATE_EXPRESSION);
     expect(normalizeWafCountryCodes([" ru ", "cn", "RU", "", "kp"])).toEqual(["RU", "CN", "KP"]);
     // `block nothing` and `allow nobody` are both silent disasters; CF rejects `{}` anyway.
@@ -1902,7 +1902,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   };
 
   it("waf-rule-upsert: a normal page from an allowed country is UNTOUCHED — it reaches the site", () => {
-    for (const country of ["AU", "US", "GB", "NZ", "FR", "IE"]) {
+    for (const country of ["AU", "US", "GB", "NZ", "FR", "IE", "TH"]) {
       expect(edgeVerdict({ ...ANON_PAGE, country })).toBe("reaches-origin");
     }
     expect(edgeVerdict({ ...ANON_PAGE, path: "/" })).toBe("reaches-origin");
