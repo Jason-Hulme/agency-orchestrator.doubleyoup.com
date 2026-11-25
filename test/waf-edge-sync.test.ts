@@ -861,6 +861,61 @@ describe("waf-edge-sync: params validation", () => {
     expect(validateWafEdgeSyncParams(rawParams({ block: [entry({ hosts: ["shop.example.org", "example.com"] })] })).ok).toBe(true);
   });
 
+  it("baseline.frontendGeoExemptions: absent and [] mean none; a sorted list comes back as fresh entries (hub#598)", () => {
+    const baseline = rawParams().baseline as Record<string, unknown>;
+    const withoutKey = validParams();
+    expect(withoutKey.baseline).not.toHaveProperty("frontendGeoExemptions");
+    expect(validParams({ baseline: { ...baseline, frontendGeoExemptions: [] } })).toEqual(withoutKey);
+
+    const exemptions = [
+      { host: "dash.example.com", cookie: "__Secure-app.session" },
+      { host: "portal.example.com", cookie: "sid" },
+    ];
+    const params = validParams({ baseline: { ...baseline, frontendGeoExemptions: exemptions } });
+    expect(params.baseline.frontendGeoExemptions).toEqual(exemptions);
+    expect(params.baseline.frontendGeoExemptions).not.toBe(exemptions);
+  });
+
+  it("baseline.frontendGeoExemptions: refuses every bad list (hub#598)", () => {
+    const baseline = rawParams().baseline as Record<string, unknown>;
+    const refusals: Array<{ value: unknown; reason: RegExp }> = [
+      { value: "dash.example.com", reason: /array of 0-5/ },
+      { value: [{ host: "Dash.example.com", cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      { value: [{ host: "dash.other.com", cookie: "sid" }], reason: /not the zone apex or inside the zone/ },
+      { value: [{ host: "host.example.com", cookie: "sid" }], reason: /is in excludedHosts/ },
+      { value: [{ host: "dash.example.com", cookie: "si d" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: "sid", all: true }], reason: /unknown key "all"/ },
+      { value: [{ host: "dash.example.com" }], reason: /cookie must match/ },
+      {
+        value: Array.from({ length: 6 }, (_, index) => ({ host: `h${index}.example.com`, cookie: "sid" })),
+        reason: /array of 0-5/,
+      },
+      {
+        value: [
+          { host: "portal.example.com", cookie: "sid" },
+          { host: "dash.example.com", cookie: "sid" },
+        ],
+        reason: /strictly ascending/,
+      },
+      {
+        value: [
+          { host: "dash.example.com", cookie: "sid" },
+          { host: "dash.example.com", cookie: "sid" },
+        ],
+        reason: /strictly ascending/,
+      },
+    ];
+    for (const refusal of refusals) {
+      const verdict = validateWafEdgeSyncParams(rawParams({ baseline: { ...baseline, frontendGeoExemptions: refusal.value } }));
+      if (verdict.ok) throw new Error(`accepted: ${JSON.stringify(refusal.value)}`);
+      expect(verdict.reason).toMatch(refusal.reason);
+      expect(verdict.reason).toMatch(/baseline\.frontendGeoExemptions/);
+    }
+    // The key belongs inside baseline only: at the top level it is an unknown key.
+    const topLevel = validateWafEdgeSyncParams(rawParams({ frontendGeoExemptions: [] }));
+    expect(topLevel.ok).toBe(false);
+  });
+
   it("refuses DUPLICATE list values (app sends de-duplicated params, Amendment A1)", () => {
     const entry = (overrides: Record<string, unknown>) => ({ key: "a1", hosts: ["a.example.com"], ips: ["192.0.2.1"], uas: [], ...overrides });
     for (const duplicate of [
@@ -3926,6 +3981,58 @@ describe("waf-edge-sync: the signed dispatch path", () => {
       routeEnv(),
     );
     expect(refused.status).toBe(400);
+  });
+
+  it("every bad baseline.frontendGeoExemptions list is a 400 that touches no Cloudflare API (hub#598)", async () => {
+    const baseline = rawParams().baseline as Record<string, unknown>;
+    const badLists: unknown[] = [
+      [{ host: "Dash.example.com", cookie: "sid" }], // a bad host
+      [{ host: "dash.other.com", cookie: "sid" }], // outside the zone
+      [{ host: "host.example.com", cookie: "sid" }], // in excludedHosts
+      [{ host: "dash.example.com", cookie: "sid=" }], // a bad cookie name
+      [{ host: "dash.example.com", cookie: "sid", expression: "true" }], // an extra entry key
+      Array.from({ length: 6 }, (_, index) => ({ host: `h${index}.example.com`, cookie: "sid" })), // 6 entries
+      [
+        { host: "portal.example.com", cookie: "sid" },
+        { host: "dash.example.com", cookie: "sid" },
+      ], // unsorted
+      [
+        { host: "dash.example.com", cookie: "sid" },
+        { host: "dash.example.com", cookie: "sid" },
+      ], // a duplicate
+    ];
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    for (const frontendGeoExemptions of badLists) {
+      const raw = rawParams({ baseline: { ...baseline, frontendGeoExemptions } });
+      const response = await worker.fetch(await signedRequest(raw), routeEnv());
+      expect(response.status, JSON.stringify(frontendGeoExemptions)).toBe(400);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("a valid baseline.frontendGeoExemptions list lands in the front-end rule; the other baseline rules do not change (hub#598)", async () => {
+    const baseline = rawParams().baseline as Record<string, unknown>;
+    const frontendGeoExemptions = [
+      { host: "dash.example.com", cookie: "__Secure-app.session" },
+      { host: "portal.example.com", cookie: "sid" },
+    ];
+    const fake = new FakeCloudflare(null).install();
+    const response = await worker.fetch(await signedRequest(rawParams({ baseline: { ...baseline, frontendGeoExemptions } })), routeEnv());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, op: "waf-edge-sync", rulesUsed: 6 });
+    expect(fake.customDescriptions()).toEqual(edgeWafRulesOrderWithXmlrpc());
+
+    const today = baselineBodies();
+    const ruleFor = (description: string) => fake.customRules?.find((rule) => rule.description === description);
+    expect(ruleFor(WAF_FRONTEND_GEO_DESCRIPTION)?.expression).toBe(
+      today.frontend.expression +
+        ' and not (http.host eq "dash.example.com" and http.cookie contains "__Secure-app.session=")' +
+        ' and not (http.host eq "portal.example.com" and http.cookie contains "sid=")',
+    );
+    expect(ruleFor(WAF_COUNTRY_BLOCK_DESCRIPTION)).toMatchObject(today.country);
+    expect(ruleFor(WAF_WPADMIN_GEO_DESCRIPTION)).toMatchObject(today.wpadmin);
+    expect(ruleFor(WAF_LOGIN_GATE_DESCRIPTION)).toMatchObject(today.login);
+    expect(ruleFor(WAF_EXEC_SKIP_DESCRIPTION)).toMatchObject(today.skip);
   });
 
   it("refuses invalid params with 400 and touches no Cloudflare API", async () => {

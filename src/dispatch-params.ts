@@ -19,6 +19,7 @@
 // The custom-hostname module imports only a TYPE from this one, so this import makes no runtime cycle.
 import { isCustomHostnameFqdn } from "./dispatch-params-custom-hostname.js";
 import { RATE_LIMIT_MITIGATION_SECONDS, RATE_LIMIT_PERIOD_SECONDS, RATE_LIMIT_REQUESTS_MAX } from "./edge-rate-limit.js";
+import type { WafFrontendGeoExemption } from "./edge-waf-rule.js";
 
 /** Outcome of validating a parsed params object for one op. */
 export type ParamsVerdict<P> = { ok: true; params: P } | { ok: false; reason: string };
@@ -543,10 +544,23 @@ export interface WafRuleUpsertParams {
    * phase alone. Opt-in: the script sends false unless the operator passes --managed-ruleset.
    */
   includeManagedRuleset: boolean;
+  /**
+   * 0..5 per-zone front-end geo exemptions (hub#598), strictly ascending by host then cookie. Absent
+   * or `[]` in the job => none, and the front-end rule text is unchanged. Present here only when the
+   * job carried a non-empty list.
+   */
+  frontendGeoExemptions?: WafFrontendGeoExemption[];
 }
 
 /** Every key a waf-rule-upsert job may carry. Anything else fails the job. */
-const WAF_RULE_UPSERT_KEYS: readonly string[] = ["zone", "enabled", "excludedHosts", "agentHosts", "includeManagedRuleset"];
+const WAF_RULE_UPSERT_KEYS: readonly string[] = [
+  "zone",
+  "enabled",
+  "excludedHosts",
+  "agentHosts",
+  "includeManagedRuleset",
+  "frontendGeoExemptions",
+];
 // Generous for one zone's infrastructure; Cloudflare's 4,096-character expression limit is the real
 // ceiling, and the builder checks that before any write.
 const WAF_EXCLUDED_HOSTS_MAX = 100;
@@ -584,6 +598,84 @@ function cleanWafHostList(
   return { ok: true, hosts };
 }
 
+// hub#598: a small cap keeps the front-end rule well under Cloudflare's 4,096-character limit.
+const WAF_FRONTEND_GEO_EXEMPTIONS_MAX = 5;
+const WAF_FRONTEND_GEO_EXEMPTION_KEYS: readonly string[] = ["host", "cookie"];
+// A cookie name: the dot is allowed because common session cookie names carry one. No quote, no
+// backslash, no space and no "=", so the name cannot break out of the quoted Rules-language string.
+const WAF_FRONTEND_GEO_COOKIE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
+
+/** Code-unit order of two exemptions: by host, then by cookie. Negative when `a` comes first. */
+function compareWafFrontendGeoExemptions(a: WafFrontendGeoExemption, b: WafFrontendGeoExemption): number {
+  if (a.host !== b.host) {
+    if (a.host < b.host) {
+      return -1;
+    }
+    return 1;
+  }
+  if (a.cookie === b.cookie) {
+    return 0;
+  }
+  if (a.cookie < b.cookie) {
+    return -1;
+  }
+  return 1;
+}
+
+/**
+ * Validate the optional per-zone front-end geo exemptions (hub#598), shared by waf-rule-upsert and
+ * waf-edge-sync. Absent or `[]` => `exemptions: []`. Each entry is exactly `{ host, cookie }`: the
+ * host is the zone apex or inside the zone and not in `excludedHosts` (an excluded host is exempt
+ * already, so a cookie clause on it means the caller is confused). The list must be strictly
+ * ascending by host then cookie, which also refuses a duplicate. Returns FRESH objects.
+ */
+function cleanWafFrontendGeoExemptions(
+  value: unknown,
+  zone: string,
+  excludedHosts: readonly string[],
+  label: string,
+): { ok: true; exemptions: WafFrontendGeoExemption[] } | { ok: false; reason: string } {
+  if (value === undefined) {
+    return { ok: true, exemptions: [] };
+  }
+  if (!Array.isArray(value) || value.length > WAF_FRONTEND_GEO_EXEMPTIONS_MAX) {
+    return { ok: false, reason: `${label}, when present, must be an array of 0-${WAF_FRONTEND_GEO_EXEMPTIONS_MAX} { host, cookie } entries` };
+  }
+  const exemptions: WafFrontendGeoExemption[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const entry: unknown = value[index];
+    const entryLabel = `${label}[${index}]`;
+    if (!isPlainObject(entry)) {
+      return { ok: false, reason: `${entryLabel} must be a JSON object with exactly the keys host and cookie` };
+    }
+    const unknownKey = unknownKeyReason(entry, WAF_FRONTEND_GEO_EXEMPTION_KEYS, entryLabel);
+    if (unknownKey !== null) {
+      return { ok: false, reason: unknownKey };
+    }
+    const { host, cookie } = entry;
+    if (typeof host !== "string" || host.length > DNS_NAME_MAX_LENGTH || !DNS_ZONE_RE.test(host)) {
+      return { ok: false, reason: `${entryLabel}.host must be a lowercase hostname` };
+    }
+    const insideZone = host === zone || host.endsWith(`.${zone}`);
+    if (!insideZone) {
+      return { ok: false, reason: `${entryLabel}.host "${host}" is not the zone apex or inside the zone ${zone}` };
+    }
+    if (excludedHosts.includes(host)) {
+      return { ok: false, reason: `${entryLabel}.host "${host}" is in excludedHosts, which the front-end rule exempts already` };
+    }
+    if (typeof cookie !== "string" || !WAF_FRONTEND_GEO_COOKIE_RE.test(cookie)) {
+      return { ok: false, reason: `${entryLabel}.cookie must match ${WAF_FRONTEND_GEO_COOKIE_RE.source}` };
+    }
+    const exemption: WafFrontendGeoExemption = { host, cookie };
+    const previous = exemptions[exemptions.length - 1];
+    if (previous !== undefined && compareWafFrontendGeoExemptions(previous, exemption) >= 0) {
+      return { ok: false, reason: `${label} must be strictly ascending by host then cookie, with no duplicate (at ${entryLabel})` };
+    }
+    exemptions.push(exemption);
+  }
+  return { ok: true, exemptions };
+}
+
 export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRuleUpsertParams> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: "params must be a JSON object" };
@@ -593,7 +685,7 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
       return { ok: false, reason: `unknown param "${key}" — waf-rule-upsert takes only ${WAF_RULE_UPSERT_KEYS.join(", ")}` };
     }
   }
-  const { zone, enabled, excludedHosts, agentHosts, includeManagedRuleset } = raw;
+  const { zone, enabled, excludedHosts, agentHosts, includeManagedRuleset, frontendGeoExemptions } = raw;
 
   // The same zone grammar the DNS ops use. It also reaches the front-end rule's media-suffix clause,
   // inside a quoted string, which this grammar keeps safe.
@@ -621,22 +713,28 @@ export function validateWafRuleUpsertParams(raw: unknown): ParamsVerdict<WafRule
   if (typeof includeManagedRuleset !== "boolean") {
     return { ok: false, reason: "includeManagedRuleset must be true or false" };
   }
+  const exemptions = cleanWafFrontendGeoExemptions(frontendGeoExemptions, zone, excluded.hosts, "frontendGeoExemptions");
+  if (!exemptions.ok) {
+    return exemptions;
+  }
 
   // An absent `enabled` means "on". Normalize it here so the actuator always sees a boolean.
   let enabledValue = true;
   if (enabled === false) {
     enabledValue = false;
   }
-  return {
-    ok: true,
-    params: {
-      zone,
-      enabled: enabledValue,
-      excludedHosts: excluded.hosts,
-      agentHosts: agents.hosts,
-      includeManagedRuleset,
-    },
+  const params: WafRuleUpsertParams = {
+    zone,
+    enabled: enabledValue,
+    excludedHosts: excluded.hosts,
+    agentHosts: agents.hosts,
+    includeManagedRuleset,
   };
+  // Only a non-empty list rides along, so a job without exemptions validates to the same params as before.
+  if (exemptions.exemptions.length > 0) {
+    params.frontendGeoExemptions = exemptions.exemptions;
+  }
+  return { ok: true, params };
 }
 
 // ── waf-edge-sync ────────────────────────────────────────────────────────────────────
@@ -673,6 +771,8 @@ export interface WafEdgeSyncBaseline {
   includeManagedRuleset: boolean;
   /** "block" = the xmlrpc rule is enabled (when `enabled` is true). "off" = present but disabled. */
   xmlrpc: "block" | "off";
+  /** The waf-rule-upsert meaning (hub#598): 0..5 front-end geo exemptions. Present only when non-empty. */
+  frontendGeoExemptions?: WafFrontendGeoExemption[];
 }
 
 /** One ban-like entry of the `block` list. `hosts: []` = the whole zone except excludedHosts. */
@@ -746,6 +846,7 @@ const WAF_EDGE_SYNC_BASELINE_KEYS: readonly string[] = [
   "agentHosts",
   "includeManagedRuleset",
   "xmlrpc",
+  "frontendGeoExemptions",
 ];
 const WAF_EDGE_SYNC_BLOCK_ENTRY_KEYS: readonly string[] = ["key", "hosts", "ips", "uas"];
 const WAF_EDGE_SYNC_CHALLENGE_ENTRY_KEYS: readonly string[] = ["key", "hosts", "all", "ips", "uas"];
@@ -1267,6 +1368,15 @@ export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSy
   if (baseline.xmlrpc !== "block" && baseline.xmlrpc !== "off") {
     return { ok: false, reason: 'baseline.xmlrpc must be "block" or "off"' };
   }
+  const exemptions = cleanWafFrontendGeoExemptions(
+    baseline.frontendGeoExemptions,
+    zone,
+    excluded.hosts,
+    "baseline.frontendGeoExemptions",
+  );
+  if (!exemptions.ok) {
+    return exemptions;
+  }
 
   const blockList = validateWafEdgeSyncList(block, "block", excluded.hosts);
   if (!blockList.ok) {
@@ -1310,17 +1420,22 @@ export function validateWafEdgeSyncParams(raw: unknown): ParamsVerdict<WafEdgeSy
     }
     challengeEntries.push(challengeEntry);
   }
+  const cleanBaseline: WafEdgeSyncBaseline = {
+    enabled: baseline.enabled,
+    excludedHosts: excluded.hosts,
+    agentHosts: agents.hosts,
+    includeManagedRuleset: baseline.includeManagedRuleset,
+    xmlrpc: baseline.xmlrpc,
+  };
+  // Only a non-empty list rides along, so a job without exemptions validates to the same params as before.
+  if (exemptions.exemptions.length > 0) {
+    cleanBaseline.frontendGeoExemptions = exemptions.exemptions;
+  }
   return {
     ok: true,
     params: {
       zone,
-      baseline: {
-        enabled: baseline.enabled,
-        excludedHosts: excluded.hosts,
-        agentHosts: agents.hosts,
-        includeManagedRuleset: baseline.includeManagedRuleset,
-        xmlrpc: baseline.xmlrpc,
-      },
+      baseline: cleanBaseline,
       block: blockEntries,
       challenge: challengeEntries,
       reservedSlots: reservedSlotsValue,
