@@ -312,8 +312,14 @@ class FakeCloud {
   private answerList(parsed: URL): Response {
     const prefix = parsed.searchParams.get("prefix") ?? "";
     const maxKeys = Number(parsed.searchParams.get("max-keys") ?? "1000");
-    const start = Number(parsed.searchParams.get("continuation-token") ?? "0");
-    const keys = [...this.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
+    const continuationToken = parsed.searchParams.get("continuation-token");
+    const start = Number(continuationToken ?? "0");
+    // Like S3: start-after counts only on the first page; a continuation token already carries the position.
+    const startAfter = parsed.searchParams.get("start-after");
+    let keys = [...this.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
+    if (startAfter !== null && continuationToken === null) {
+      keys = keys.filter((key) => key > startAfter);
+    }
     const page = keys.slice(start, start + maxKeys);
     let xml = "<ListBucketResult>";
     for (const key of page) {
@@ -1244,6 +1250,180 @@ describe("hub#222 media-trash-list", () => {
     if (!result.ok) throw new Error(result.detail);
     expect(result.entries.map((entry) => entry.key)).toEqual(["trash/2026-11-04/acme/b.jpg"]);
     expect(result.entries[0]?.etag).toBe(fakeEtag("x"));
+  });
+});
+
+describe("hub#588 /media/list", () => {
+  interface ListAnswer {
+    ok: boolean;
+    action: string;
+    entries: Array<{ key: string; size: number | null }>;
+    nextCursor: string | null;
+  }
+
+  it("lists only the site's live keys under the prefix, with sizes, and writes nothing", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/2026/a.css", "abc");
+    fake.put("acme/2026/b.woff2", "abcdef");
+    fake.put("acme/trash/hidden.jpg", "x");
+    fake.put("acmex/other-site.jpg", "x");
+    fake.put("trash/2026-11-04/acme/old.jpg", "x");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("list", { bucket: BUCKET, prefix: "acme/" }, credential, env());
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = (await response.json()) as ListAnswer;
+    expect(body).toEqual({
+      ok: true,
+      action: "list",
+      entries: [
+        { key: "acme/2026/a.css", size: 3 },
+        { key: "acme/2026/b.woff2", size: 6 },
+      ],
+      nextCursor: null,
+    });
+    const listCall = fake.s3Calls().find((call) => call.method === "GET");
+    const query = new URL(listCall?.url ?? "").searchParams;
+    expect(query.get("prefix")).toBe("acme/");
+    expect(query.get("max-keys")).toBe("1000");
+    expect(query.get("start-after")).toBeNull();
+    expect(fake.writes()).toEqual([]);
+    // Read-only: no key lease is taken.
+    expect(fake.s3Calls().every((call) => call.method === "GET")).toBe(true);
+    await expectNoSecrets(body);
+  });
+
+  it("pages with nextCursor and passes maxKeys through", async () => {
+    const fake = new FakeCloud().install();
+    for (let index = 0; index < 5; index += 1) {
+      fake.put(`acme/f${index}.css`, "x");
+    }
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    const first = (await (await siteRequest("list", { bucket: BUCKET, prefix: "acme/", maxKeys: 2 }, credential, workerEnv)).json()) as ListAnswer;
+    expect(first.entries.map((entry) => entry.key)).toEqual(["acme/f0.css", "acme/f1.css"]);
+    expect(first.nextCursor).toBe("2");
+    const keys = [...first.entries.map((entry) => entry.key)];
+    let cursor = first.nextCursor;
+    while (cursor !== null) {
+      const response = await siteRequest("list", { bucket: BUCKET, prefix: "acme/", maxKeys: 2, cursor }, credential, workerEnv);
+      expect(response.status).toBe(200);
+      const page = (await response.json()) as ListAnswer;
+      keys.push(...page.entries.map((entry) => entry.key));
+      cursor = page.nextCursor;
+    }
+    expect(keys).toEqual(["acme/f0.css", "acme/f1.css", "acme/f2.css", "acme/f3.css", "acme/f4.css"]);
+    const tokens = fake.s3Calls().map((call) => new URL(call.url).searchParams.get("continuation-token"));
+    expect(tokens).toContain("2");
+    expect(tokens).toContain("4");
+  });
+
+  it("passes startAfter through as start-after", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/a.css", "x");
+    fake.put("acme/b.css", "x");
+    fake.put("acme/c.css", "x");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("list", { bucket: BUCKET, prefix: "acme/", startAfter: "acme/a.css" }, credential, env());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as ListAnswer;
+    expect(body.entries.map((entry) => entry.key)).toEqual(["acme/b.css", "acme/c.css"]);
+    const listCall = fake.s3Calls().find((call) => call.method === "GET");
+    expect(new URL(listCall?.url ?? "").searchParams.get("start-after")).toBe("acme/a.css");
+  });
+
+  it("a folder prefix lists only that folder", async () => {
+    const fake = new FakeCloud().install();
+    fake.put("acme/2025/a.css", "x");
+    fake.put("acme/2026/b.css", "x");
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("list", { bucket: BUCKET, prefix: "acme/2026/" }, credential, env());
+    const body = (await response.json()) as ListAnswer;
+    expect(body.entries.map((entry) => entry.key)).toEqual(["acme/2026/b.css"]);
+  });
+
+  it("refuses a prefix outside the site, under trash/, a bad cursor, startAfter or maxKeys, and unknown fields with 400", async () => {
+    const fake = new FakeCloud().install();
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const workerEnv = env();
+    const bodies: unknown[] = [
+      { bucket: BUCKET },
+      { bucket: BUCKET, prefix: "" },
+      { bucket: BUCKET, prefix: "acme" },
+      { bucket: BUCKET, prefix: "other/" },
+      { bucket: BUCKET, prefix: "acmex/" },
+      { bucket: BUCKET, prefix: "trash/" },
+      { bucket: BUCKET, prefix: "trash/2026-11-04/acme/" },
+      { bucket: BUCKET, prefix: "acme/trash/" },
+      { bucket: BUCKET, prefix: "acme/../other/" },
+      { bucket: BUCKET, prefix: "acme//" },
+      { bucket: BUCKET, prefix: `acme/${"a".repeat(900)}/` },
+      { bucket: BUCKET, prefix: 7 },
+      { bucket: BUCKET, prefix: "acme/", cursor: "has space" },
+      { bucket: BUCKET, prefix: "acme/", cursor: "" },
+      { bucket: BUCKET, prefix: "acme/", cursor: "x".repeat(1025) },
+      { bucket: BUCKET, prefix: "acme/", startAfter: "other/a.css" },
+      { bucket: BUCKET, prefix: "acme/", startAfter: "trash/2026-11-04/acme/a.css" },
+      { bucket: BUCKET, prefix: "acme/", startAfter: "acme/a\nb" },
+      { bucket: BUCKET, prefix: "acme/", startAfter: 3 },
+      { bucket: BUCKET, prefix: "acme/", maxKeys: 0 },
+      { bucket: BUCKET, prefix: "acme/", maxKeys: 1001 },
+      { bucket: BUCKET, prefix: "acme/", maxKeys: 2.5 },
+      { bucket: BUCKET, prefix: "acme/", maxKeys: "10" },
+      { bucket: BUCKET, prefix: "acme/", delimiter: "/" },
+      { bucket: BUCKET, prefix: "acme/", key: "acme/a.css" },
+    ];
+    for (const body of bodies) {
+      const response = await siteRequest("list", body, credential, workerEnv);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(fake.s3Calls()).toEqual([]);
+  });
+
+  it("refuses a missing or wrong credential with 401 before touching R2", async () => {
+    const fake = new FakeCloud().install();
+    const workerEnv = env();
+    const otherCredential = await mediaSiteCredential(SITE_SECRET, OTHER_BUCKET);
+    const body = { bucket: BUCKET, prefix: "acme/" };
+    expect((await siteRequest("list", body, null, workerEnv)).status).toBe(401);
+    expect((await siteRequest("list", body, "0".repeat(64), workerEnv)).status).toBe(401);
+    expect((await siteRequest("list", body, otherCredential, workerEnv)).status).toBe(401);
+    expect(fake.calls).toEqual([]);
+  });
+
+  it("counts against the bucket's rate limit", async () => {
+    const fake = new FakeCloud().install();
+    const nonce = fakeNonceStore();
+    const workerEnv = env({ NONCE_STORE: nonce.namespace as Env["NONCE_STORE"] });
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const store = new FakeRateStore();
+    store.counts.set(BUCKET, MEDIA_SITE_RATE_LIMIT_PER_MINUTE - 1);
+    nonce.instances.set(`media-rate:${BUCKET}`, store);
+    const allowed = await siteRequest("list", { bucket: BUCKET, prefix: "acme/" }, credential, workerEnv);
+    expect(allowed.status).toBe(200);
+    const limited = await siteRequest("list", { bucket: BUCKET, prefix: "acme/" }, credential, workerEnv);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("12");
+    expect(fake.s3Calls().filter((call) => call.method === "GET")).toHaveLength(1);
+  });
+
+  it("answers 502 without the signed URL when R2 refuses the listing", async () => {
+    const fake = new FakeCloud().install();
+    const original = fake.handle.bind(fake);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith(S3_ENDPOINT) && (init?.method ?? "GET") === "GET") {
+        return new Response("<Error><Code>InternalError</Code></Error>", { status: 500 });
+      }
+      return original(input, init);
+    });
+    const credential = await mediaSiteCredential(SITE_SECRET, BUCKET);
+    const response = await siteRequest("list", { bucket: BUCKET, prefix: "acme/" }, credential, env());
+    expect(response.status).toBe(502);
+    const text = await response.text();
+    expect(text).not.toContain(S3_ENDPOINT);
+    expect(text).not.toContain("X-Amz");
+    await expectNoSecrets(text);
   });
 });
 
