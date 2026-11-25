@@ -2659,8 +2659,9 @@ describe("waf-rule-upsert: unchanged by the waf-edge-sync run limits", () => {
     expect(transcripts[2]?.match(/^PATCH /gm)).toHaveLength(4);
     const transcript = transcripts.join("\n=====\n");
     expect(transcript).not.toContain("signal");
-    // Recorded from the code before the run limits existed (commit 910cc49).
-    expect(await sha256Hex(transcript)).toBe("dfcb51fa72090f8504d432d919bf97696d48d11a524f1c92cc1cb0c9a70bbbf5");
+    // Recorded from the code before the run limits existed (commit 910cc49); re-recorded when TH
+    // joined the allow-list (hub#594) — the country list rides in the rule bodies of this transcript.
+    expect(await sha256Hex(transcript)).toBe("4d15ad2b3cdd982af563bf7b3af4ab796d25885db2a28d10afff3aedb6f01913");
   });
 });
 

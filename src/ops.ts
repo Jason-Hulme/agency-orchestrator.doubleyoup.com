@@ -87,6 +87,13 @@
 // is a KV PUT of the same value; both deletes treat an absent route or key as "already-absent". A stale
 // routeId falls through to one list of the agency zone's routes, so a replacement route is found, never
 // reported as "already-absent".
+// The eleven hub#476 self-hosted server ops (actuate-host.ts, planning/58 §6.1) are idempotent except one:
+// `host-ssh-check`, `host-vm-get` and `host-vm-list` are reads; `host-bootstrap`/`host-repair` in mode "poll" only
+// read the run's state and in mode "start" start at most one run per cell; `host-network-ensure` converges;
+// `host-vm-create` is idempotent by name (the host-agent compares the spec); `host-vm-delete` treats an absent VM as
+// "already-absent"; `host-vm-snapshot` reports an existing snapshot of that name; `host-vm-set-boot-script` answers
+// changed:false when the VM already holds the values. `host-vm-restart` is NOT: every run reboots the node, so it
+// runs exactly once under F1, like gcp-instance-restart.
 
 import type { Env } from "./env.js";
 import type { DispatchOp } from "./dispatch-verify.js";
@@ -296,11 +303,46 @@ import {
 } from "./dispatch-params-media.js";
 import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
 import { actuateEdgeGateDeploy } from "./actuate-edge-gate.js";
+import {
+  type HostBootstrapParams,
+  type HostNetworkEnsureParams,
+  type HostSshCheckParams,
+  type HostVmCreateParams,
+  type HostVmDeleteParams,
+  type HostVmGetParams,
+  type HostVmListParams,
+  type HostVmRestartParams,
+  type HostVmSetBootScriptParams,
+  type HostVmSnapshotParams,
+  validateHostBootstrapParams,
+  validateHostNetworkEnsureParams,
+  validateHostSshCheckParams,
+  validateHostVmCreateParams,
+  validateHostVmDeleteParams,
+  validateHostVmGetParams,
+  validateHostVmListParams,
+  validateHostVmRestartParams,
+  validateHostVmSetBootScriptParams,
+  validateHostVmSnapshotParams,
+} from "./dispatch-params-host.js";
+import {
+  type HostOpResult,
+  actuateHostInstall,
+  actuateHostNetworkEnsure,
+  actuateHostSshCheck,
+  actuateHostVmCreate,
+  actuateHostVmDelete,
+  actuateHostVmGet,
+  actuateHostVmList,
+  actuateHostVmRestart,
+  actuateHostVmSetBootScript,
+  actuateHostVmSnapshot,
+} from "./actuate-host.js";
 
 /** A fully-typed op definition: validate/actuate agree on the params type P. */
 interface OpDefinition<P> {
   validateParams(raw: unknown): ParamsVerdict<P>;
-  actuate(params: P, env: Env): Promise<ActuateResult>;
+  actuate(params: P, env: Env): Promise<ActuateResult | HostOpResult>;
 }
 
 /**
@@ -310,7 +352,7 @@ interface OpDefinition<P> {
  */
 export interface RegisteredOp {
   validateParams(raw: unknown): ParamsVerdict<unknown>;
-  actuate(params: unknown, env: Env): Promise<ActuateResult>;
+  actuate(params: unknown, env: Env): Promise<ActuateResult | HostOpResult>;
 }
 
 function defineOp<P>(definition: OpDefinition<P>): RegisteredOp {
@@ -469,7 +511,7 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   }),
   "provision-ssh-keys": defineOp<ProvisionSshKeysParams>({
     validateParams: validateProvisionSshKeysParams,
-    actuate: (params, env) => actuateProvisionSshKeys(params, env),
+    actuate: (params) => actuateProvisionSshKeys(params),
   }),
   "gcp-instance-get": defineOp<GcpInstanceGetParams>({
     validateParams: validateGcpInstanceGetParams,
@@ -586,6 +628,51 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "media-bulk-credential": defineOp<MediaBulkCredentialParams>({
     validateParams: validateMediaBulkCredentialParams,
     actuate: (params, env) => actuateMediaBulkCredential(params, env),
+  }),
+  // hub#476 / planning/58 §6 (actuate-host.ts, params in dispatch-params-host.ts): self-hosted servers.
+  "host-ssh-check": defineOp<HostSshCheckParams>({
+    validateParams: validateHostSshCheckParams,
+    actuate: (params, env) => actuateHostSshCheck(params, env),
+  }),
+  "host-bootstrap": defineOp<HostBootstrapParams>({
+    validateParams: validateHostBootstrapParams,
+    actuate: (params, env) => actuateHostInstall("host-bootstrap", params, env),
+  }),
+  "host-repair": defineOp<HostBootstrapParams>({
+    validateParams: validateHostBootstrapParams,
+    actuate: (params, env) => actuateHostInstall("host-repair", params, env),
+  }),
+  "host-network-ensure": defineOp<HostNetworkEnsureParams>({
+    validateParams: validateHostNetworkEnsureParams,
+    actuate: (params, env) => actuateHostNetworkEnsure(params, env),
+  }),
+  "host-vm-create": defineOp<HostVmCreateParams>({
+    validateParams: validateHostVmCreateParams,
+    actuate: (params, env) => actuateHostVmCreate(params, env),
+  }),
+  "host-vm-get": defineOp<HostVmGetParams>({
+    validateParams: validateHostVmGetParams,
+    actuate: (params, env) => actuateHostVmGet(params, env),
+  }),
+  "host-vm-list": defineOp<HostVmListParams>({
+    validateParams: validateHostVmListParams,
+    actuate: (params, env) => actuateHostVmList(params, env),
+  }),
+  "host-vm-delete": defineOp<HostVmDeleteParams>({
+    validateParams: validateHostVmDeleteParams,
+    actuate: (params, env) => actuateHostVmDelete(params, env),
+  }),
+  "host-vm-restart": defineOp<HostVmRestartParams>({
+    validateParams: validateHostVmRestartParams,
+    actuate: (params, env) => actuateHostVmRestart(params, env),
+  }),
+  "host-vm-snapshot": defineOp<HostVmSnapshotParams>({
+    validateParams: validateHostVmSnapshotParams,
+    actuate: (params, env) => actuateHostVmSnapshot(params, env),
+  }),
+  "host-vm-set-boot-script": defineOp<HostVmSetBootScriptParams>({
+    validateParams: validateHostVmSetBootScriptParams,
+    actuate: (params, env) => actuateHostVmSetBootScript(params, env),
   }),
 };
 

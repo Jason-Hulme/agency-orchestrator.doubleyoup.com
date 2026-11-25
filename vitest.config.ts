@@ -6,6 +6,10 @@ import { fileURLToPath } from "node:url";
 const cloudflareWorkersStub = fileURLToPath(
   new URL("./test/stubs/cloudflare-workers.ts", import.meta.url),
 );
+// hub#476: the same for "cloudflare:sockets" (src/ssh-client.ts). No Node test opens a socket.
+const cloudflareSocketsStub = fileURLToPath(
+  new URL("./test/stubs/cloudflare-sockets.ts", import.meta.url),
+);
 
 // Two projects, run in one `vitest` invocation:
 //
@@ -26,6 +30,7 @@ export default defineConfig({
         resolve: {
           alias: {
             "cloudflare:workers": cloudflareWorkersStub,
+            "cloudflare:sockets": cloudflareSocketsStub,
           },
         },
         test: {
@@ -47,6 +52,8 @@ export default defineConfig({
             "test/edge-gate-deploy.test.ts",
             "test/waf-edge-sync.test.ts",
             "test/media-soft-delete.test.ts",
+            "test/host-ops.test.ts",
+            "test/provision-ssh-keys.test.ts",
           ],
         },
       },
@@ -55,6 +62,8 @@ export default defineConfig({
         test: {
           name: "workers",
           include: ["test/**/*.worker.test.ts"],
+          // hub#476: a real OpenSSH server in Docker for test/host-ssh.worker.test.ts (skipped without Docker).
+          globalSetup: ["./test/host-sshd.global-setup.mjs"],
         },
       },
     ],

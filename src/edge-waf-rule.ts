@@ -11,7 +11,7 @@
 // WHAT THE FIVE RULES DO, in APPLY order:
 //   1. doubleyoup-country-block  BLOCK traffic from a small set of high-abuse countries (RU/CN/KP).
 //   2. doubleyoup-wpadmin-geo    BLOCK the WordPress admin/login surface (/wp-admin + /wp-login.php)
-//                                for everyone outside the allow-list (AU/US/GB/NZ/FR/IE).
+//                                for everyone outside the allow-list (AU/US/GB/NZ/FR/IE/TH).
 //   3. doubleyoup-login-gate     MANAGED-CHALLENGE what is left of the login surface, so brute force
 //                                dies at the edge: /wp-login.php unconditionally, and /wp-admin/
 //                                except admin-ajax.php and an already-logged-in session.
@@ -173,7 +173,7 @@ const WAF_BLOCK_COUNTRIES: readonly string[] = ["RU", "CN", "KP"];
  * The allow-list: countries that may reach the WordPress admin/login surface and that are NOT
  * challenged on the front end. ISO-3166 alpha-2. A CONSTANT: no signed job can change it.
  */
-const WAF_ALLOW_COUNTRIES: readonly string[] = ["AU", "US", "GB", "NZ", "FR", "IE"];
+const WAF_ALLOW_COUNTRIES: readonly string[] = ["AU", "US", "GB", "NZ", "FR", "IE", "TH"];
 
 /** The rule body Cloudflare's ruleset API takes (POST/PATCH of one rule). */
 export interface WafRule {

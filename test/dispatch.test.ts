@@ -275,9 +275,9 @@ const SYD_LIVE_LOGIN_GATE_EXPRESSION =
   '(http.request.uri.path eq "/wp-login.php") or (starts_with(http.request.uri.path, "/wp-admin/") and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") and not (http.cookie contains "wordpress_logged_in_"))';
 const SYD_LIVE_COUNTRY_BLOCK_EXPRESSION = 'ip.geoip.country in {"RU" "CN" "KP"}';
 const SYD_LIVE_WPADMIN_GEO_EXPRESSION =
-  '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
+  '(http.request.uri.path contains "/wp-admin" or http.request.uri.path eq "/wp-login.php") and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"})';
 const SYD_LIVE_FRONTEND_GEO_EXPRESSION =
-  'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"}) and not (cf.verified_bot_category eq "Search Engine Crawler") and not (http.host in {"app.doubleyoup.com" "status.doubleyoup.com" "media.doubleyoup.com" "host.doubleyoup.com" "cell-syd.doubleyoup.com"})';
+  'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"}) and not (cf.verified_bot_category eq "Search Engine Crawler") and not (http.host in {"app.doubleyoup.com" "status.doubleyoup.com" "media.doubleyoup.com" "host.doubleyoup.com" "cell-syd.doubleyoup.com"})';
 const SYD_LIVE_EXEC_SKIP_EXPRESSION =
   '(http.host eq "cell-syd.doubleyoup.com" and starts_with(http.request.uri.path, "/exec"))';
 const SYD_LIVE_EXEC_SKIP_DESCRIPTION = "skip managed WAF for cell-agent exec (internal bearer-authed endpoint)";
@@ -290,7 +290,7 @@ const EXPECTED_SYD_AGENT_SKIP_EXPRESSION = '(http.host in {"cell-syd.doubleyoup.
 const EXPECTED_WPADMIN_GEO_EXPRESSION =
   '(starts_with(http.request.uri.path, "/wp-admin") or http.request.uri.path eq "/wp-login.php") ' +
   'and not (http.request.uri.path eq "/wp-admin/admin-ajax.php") ' +
-  'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"})';
+  'and not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"})';
 
 // A wp-cli job — a SAFE read-only command (option get siteurl) by default.
 const WP_CLI_PARAMS = {
@@ -336,10 +336,16 @@ function dbImportJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
 
 // A provision-ssh-keys job — declare the FULL authorized-key set for a storage-tier dogfood site
 // (planning/39). The gateway cell-agent writes them; nothing sensitive comes back.
+// agency-orchestrator#22: the job carries app's push number and names the gateway of the site's own cell.
+const SSH_KEYS_GATEWAY_URL = "https://cell-region-gw.example.test";
+const SSH_KEYS_GATEWAY_TOKEN = "0123456789abcdef".repeat(4);
 const SSH_KEYS_JOB_PARAMS = {
   project: "dy-agency-proof",
   slug: "geelongns",
   authorizedKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample000000000000000000000000000000000 dev@laptop"],
+  generation: 42,
+  gatewayAgentUrl: SSH_KEYS_GATEWAY_URL,
+  gatewayAgentToken: SSH_KEYS_GATEWAY_TOKEN,
 };
 function sshKeysJob(overrides: Partial<DispatchJob> = {}): DispatchJob {
   return sampleJob({
@@ -1252,6 +1258,17 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-subnet-delete",
       "gcp-subnet-get",
       "gcp-subnets-list",
+      "host-bootstrap",
+      "host-network-ensure",
+      "host-repair",
+      "host-ssh-check",
+      "host-vm-create",
+      "host-vm-delete",
+      "host-vm-get",
+      "host-vm-list",
+      "host-vm-restart",
+      "host-vm-set-boot-script",
+      "host-vm-snapshot",
       "media-bucket-protect",
       "media-bulk-credential",
       "media-hostmap-delete",
@@ -1341,8 +1358,41 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ mode: "hosts", hosts: ["Doubleyoup.com"] }).ok).toBe(false); // uppercase
     expect(bad({ mode: "hosts", hosts: ["https://doubleyoup.com/x"] }).ok).toBe(false); // URL, not a hostname
     expect(bad({ mode: "hosts", hosts: ["*.doubleyoup.com"] }).ok).toBe(false); // wildcard
-    expect(bad({ mode: "hosts", hosts: ["evil.com"] }).ok).toBe(false); // out of zone
-    expect(bad({ mode: "hosts", hosts: ["notdoubleyoup.com"] }).ok).toBe(false); // suffix trick
+    expect(bad({ mode: "hosts", hosts: ["https://www.customer.example"] }).ok).toBe(false); // scheme
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example."] }).ok).toBe(false); // trailing dot
+    expect(bad({ mode: "hosts", hosts: ["*.customer.example"] }).ok).toBe(false); // wildcard, outside the zone
+    expect(bad({ mode: "hosts", hosts: ["WWW.customer.example"] }).ok).toBe(false); // uppercase, outside the zone
+    expect(bad({ mode: "hosts", hosts: ["customer"] }).ok).toBe(false); // single label
+    expect(bad({ mode: "hosts", hosts: ["192.0.2.1"] }).ok).toBe(false); // IPv4 literal
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example/path"] }).ok).toBe(false); // path
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example:8443"] }).ok).toBe(false); // port
+    expect(bad({ mode: "hosts", hosts: [" www.customer.example"] }).ok).toBe(false); // padded
+    expect(bad({ mode: "hosts", hosts: ["under_score.customer.example"] }).ok).toBe(false); // not a host name
+    expect(bad({ mode: "hosts", hosts: [`${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(60)}.${"e".repeat(60)}.example`] }).ok).toBe(false); // over 253
+    // one bad entry refuses the whole list, even next to valid ones
+    expect(bad({ mode: "hosts", hosts: ["www.customer.example", "*.customer.example"] }).ok).toBe(false);
+  });
+
+  it("cache-purge: mode hosts accepts a customer domain outside the zone, and keeps the entries unchanged", () => {
+    const hosts = ["www.customer.example", "customer.example", "site-production.doubleyoup.com"];
+    expect(validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts })).toEqual({
+      ok: true,
+      params: { zone: "doubleyoup.com", mode: "hosts", hosts },
+    });
+    // The params carry a fresh array, not the caller's.
+    const verdict = validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts });
+    expect(verdict.ok && verdict.params.mode === "hosts" && verdict.params.hosts !== hosts).toBe(true);
+    // A list of exactly 30 customer domains is the cap, and passes.
+    const thirty = Array.from({ length: 30 }, (_, index) => `www${index}.customer.example`);
+    expect(validateCachePurgeParams({ zone: "doubleyoup.com", mode: "hosts", hosts: thirty }).ok).toBe(true);
+  });
+
+  it("cache-purge: mode files and mode everything still refuse a URL or host outside the zone", () => {
+    const bad = (overrides: Record<string, unknown>) =>
+      validateCachePurgeParams({ zone: "doubleyoup.com", mode: "everything", ...overrides });
+    expect(bad({ mode: "files", files: ["https://www.customer.example/x"] }).ok).toBe(false);
+    expect(bad({ mode: "files", files: ["https://doubleyoup.com/x", "https://www.customer.example/x"] }).ok).toBe(false);
+    expect(bad({ mode: "everything", hosts: ["www.customer.example"] }).ok).toBe(false);
   });
 
   // ── cache-rule-upsert (twin of the app's rules) ───────────────────────────────────
@@ -1534,7 +1584,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
 
   // The front-end rule for WAF_RULE_PARAMS (example.com, two excluded hosts).
   const EXPECTED_FRONTEND_GEO_EXPRESSION =
-    'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE"}) ' +
+    'not (ip.geoip.country in {"AU" "US" "GB" "NZ" "FR" "IE" "TH"}) ' +
     'and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
     'and not (http.host in {"cell-x.example.com" "host.example.com"}) ' +
     'and not ends_with(http.host, "-media.example.com")';
@@ -1657,7 +1707,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   it("waf-rule-upsert: the expression helpers normalize codes and REFUSE an empty set", () => {
     expect(wafCountryBlockExpression(["RU", "CN", "KP"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
     expect(wafCountryBlockExpression([" ru ", "cn", "RU", "kp"])).toBe(EXPECTED_COUNTRY_BLOCK_EXPRESSION);
-    expect(wafWpAdminGeoExpression(["AU", "US", "GB", "NZ", "FR", "IE"])).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
+    expect(wafWpAdminGeoExpression(["AU", "US", "GB", "NZ", "FR", "IE", "TH"])).toBe(EXPECTED_WPADMIN_GEO_EXPRESSION);
     expect(wafLoginGateExpression()).toBe(EXPECTED_LOGIN_GATE_EXPRESSION);
     expect(normalizeWafCountryCodes([" ru ", "cn", "RU", "", "kp"])).toEqual(["RU", "CN", "KP"]);
     // `block nothing` and `allow nobody` are both silent disasters; CF rejects `{}` anyway.
@@ -1852,7 +1902,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   };
 
   it("waf-rule-upsert: a normal page from an allowed country is UNTOUCHED — it reaches the site", () => {
-    for (const country of ["AU", "US", "GB", "NZ", "FR", "IE"]) {
+    for (const country of ["AU", "US", "GB", "NZ", "FR", "IE", "TH"]) {
       expect(edgeVerdict({ ...ANON_PAGE, country })).toBe("reaches-origin");
     }
     expect(edgeVerdict({ ...ANON_PAGE, path: "/" })).toBe("reaches-origin");
@@ -2162,25 +2212,25 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   const SSH_ED25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample000000000000000000000000000000000 dev@laptop";
   const SSH_RSA = `ssh-rsa ${"A".repeat(372)}== ci@runner`;
   const SSH_ECDSA = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBExample00000000000";
-  const SSH_KEYS_PARAMS = { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519] };
+  const SSH_KEYS_PARAMS = { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519], generation: 7 };
 
   it("provision-ssh-keys: accepts ed25519 / rsa / ecdsa keys, an EMPTY set (revoke-all), and returns only known keys", () => {
     expect(validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, extra: "x" })).toEqual({ ok: true, params: SSH_KEYS_PARAMS });
-    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_RSA] }).ok).toBe(true);
-    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ECDSA] }).ok).toBe(true);
+    expect(validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys: [SSH_RSA] }).ok).toBe(true);
+    expect(validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys: [SSH_ECDSA] }).ok).toBe(true);
     // A key WITHOUT a comment is valid (the comment is optional).
     expect(
-      validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519.split(" ").slice(0, 2).join(" ")] }).ok,
+      validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys: [SSH_ED25519.split(" ").slice(0, 2).join(" ")] }).ok,
     ).toBe(true);
     // The FULL desired set can be empty — that revokes every key on the gateway.
-    expect(validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] })).toEqual({
+    expect(validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys: [] })).toEqual({
       ok: true,
-      params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] },
+      params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [], generation: 7 },
     });
     // Multiple keys are rebuilt into a fresh array of exactly the validated lines.
     expect(
-      validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519, SSH_RSA] }),
-    ).toEqual({ ok: true, params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519, SSH_RSA] } });
+      validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys: [SSH_ED25519, SSH_RSA] }),
+    ).toEqual({ ok: true, params: { project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [SSH_ED25519, SSH_RSA], generation: 7 } });
   });
 
   it("provision-ssh-keys: rejects a bad project / slug field by field", () => {
@@ -2202,7 +2252,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   });
 
   it("provision-ssh-keys: rejects a private key, a multi-line value, garbage, an over-cap key, and an over-long list", () => {
-    const bad = (authorizedKeys: unknown) => validateProvisionSshKeysParams({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys });
+    const bad = (authorizedKeys: unknown) => validateProvisionSshKeysParams({ ...SSH_KEYS_PARAMS, authorizedKeys });
     // A PEM PRIVATE key has no key-type token -> rejected.
     expect(bad(["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"]).ok).toBe(false);
     // A multi-line value could smuggle a second authorized_keys line -> rejected (anchored regex).
@@ -5395,6 +5445,21 @@ describe("POST /actuate route", () => {
     expect(calls.find((c) => c.method === "POST")?.body).toEqual({ hosts: ["doubleyoup.com", "cdn.doubleyoup.com"] });
   });
 
+  it("cache-purge: hosts mode sends a customer domain (outside the zone) to the zone's purge_cache unchanged", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const hosts = ["www.customer.example", "customer.example", "site-production.doubleyoup.com"];
+    const job = cachePurgeJob({ params: JSON.stringify({ zone: "doubleyoup.com", mode: "hosts", hosts }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockCachePurgeApi();
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; count: number };
+    expect(body.ok).toBe(true);
+    expect(body.count).toBe(3);
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ hosts });
+  });
+
   it("cache-purge: fails cleanly when the token cannot see the zone (no purge)", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = cachePurgeJob();
@@ -6876,17 +6941,16 @@ describe("POST /actuate route", () => {
   });
 
   // ── provision-ssh-keys through the registry ────────────────────────────────────────
-  // The Worker relays {slug, authorizedKeys} to the gateway cell-agent's DEDICATED
-  // /provision-ssh-keys endpoint (NOT /exec — key material must never be shell-quoted), using the
-  // agency's OWN CELL_AGENT_TOKEN. The load-bearing assertions: it hits the right endpoint with the
-  // right body + token, the project is NOT forwarded (the gateway needs only slug + keys), and every
-  // relay failure mode is fail-closed exactly like wp-cli.
-  function mockSshKeysAgent(reply: { ok?: boolean; slug?: string; count?: number; error?: string }, status = 200) {
+  // The Worker relays {slug, authorizedKeys, generation} to the DEDICATED /provision-ssh-keys endpoint
+  // (NOT /exec — key material must never be shell-quoted) of the GATEWAY agent the signed job names,
+  // with that job's gateway token. The web node's CELL_AGENT_* pair is never used for this op.
+  // test/provision-ssh-keys.test.ts covers the target choice and the confirmation rules in depth.
+  function mockSshKeysAgent(reply: Record<string, unknown>, status = 200) {
     const calls: Array<{
       url: string;
       method: string;
       auth: string | null;
-      body: { slug?: string; authorizedKeys?: string[]; project?: string };
+      body: { slug?: string; authorizedKeys?: string[]; project?: string; generation?: number; gatewayAgentToken?: string };
     }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = urlOf(input);
@@ -6902,41 +6966,44 @@ describe("POST /actuate route", () => {
     return calls;
   }
 
-  it("provision-ssh-keys: relays {slug, authorizedKeys} to the gateway /provision-ssh-keys using CELL_AGENT_TOKEN only", async () => {
+  it("provision-ssh-keys: relays {slug, authorizedKeys, generation} to the job's gateway /provision-ssh-keys with the job's gateway token only", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = sshKeysJob();
     const signature = await signAsApp(job, privateKey);
-    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 1 });
+    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 1, generation: 42 });
 
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 1 });
+    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 1, generation: 42 });
     expect(calls).toHaveLength(1);
     const call = calls[0];
-    expect(call.url).toBe("https://cell.example.test/provision-ssh-keys");
+    expect(call.url).toBe(`${SSH_KEYS_GATEWAY_URL}/provision-ssh-keys`);
     expect(call.method).toBe("POST");
-    // The agency's OWN cell token — never a platform / Cloudflare credential.
-    expect(call.auth).toBe("Bearer cell-token-123");
+    // The job's gateway token — never the web node's CELL_AGENT_TOKEN or a Cloudflare credential.
+    expect(call.auth).toBe(`Bearer ${SSH_KEYS_GATEWAY_TOKEN}`);
+    expect(call.auth).not.toContain("cell-token-123");
     expect(call.auth).not.toContain("cf-token-xyz");
-    // The gateway needs only slug + the full key set; the platform-layer project is NOT forwarded.
+    // The gateway needs slug + the full key set + the push number; the project and the token stay out of the body.
     expect(call.body.slug).toBe("geelongns");
     expect(call.body.authorizedKeys).toEqual(SSH_KEYS_JOB_PARAMS.authorizedKeys);
+    expect(call.body.generation).toBe(42);
     expect(call.body.project).toBeUndefined();
+    expect(call.body.gatewayAgentToken).toBeUndefined();
   });
 
-  it("provision-ssh-keys: an EMPTY set (revoke-all) relays authorizedKeys:[] and reports count 0", async () => {
+  it("provision-ssh-keys: an EMPTY set (revoke-all) relays authorizedKeys:[] and reports count 0 with the echo", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
-    const job = sshKeysJob({ params: JSON.stringify({ project: "dy-agency-proof", slug: "geelongns", authorizedKeys: [] }) });
+    const job = sshKeysJob({ params: JSON.stringify({ ...SSH_KEYS_JOB_PARAMS, authorizedKeys: [] }) });
     const signature = await signAsApp(job, privateKey);
-    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 0 });
+    const calls = mockSshKeysAgent({ ok: true, slug: "geelongns", count: 0, generation: 42 });
 
     const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 0 });
+    expect(await response.json()).toEqual({ ok: true, op: "provision-ssh-keys", slug: "geelongns", count: 0, generation: 42 });
     expect(calls[0].body.authorizedKeys).toEqual([]);
   });
 
-  it("provision-ssh-keys: a cell-agent 401 becomes a clean ok:false (no bypass)", async () => {
+  it("provision-ssh-keys: a gateway 401 becomes a clean ok:false (no bypass) that never repeats the token", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = sshKeysJob();
     const signature = await signAsApp(job, privateKey);
@@ -6946,10 +7013,11 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { ok: boolean; detail: string };
     expect(body.ok).toBe(false);
-    expect(body.detail).toMatch(/rejected CELL_AGENT_TOKEN/);
+    expect(body.detail).toMatch(/rejected the gatewayAgentToken of the signed job/);
+    expect(body.detail).not.toContain(SSH_KEYS_GATEWAY_TOKEN);
   });
 
-  it("provision-ssh-keys: a cell-agent 500 (script failure) surfaces as ok:false, still HTTP 200", async () => {
+  it("provision-ssh-keys: a gateway 500 (script failure) surfaces as ok:false, still HTTP 200", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = sshKeysJob();
     const signature = await signAsApp(job, privateKey);
@@ -6959,23 +7027,21 @@ describe("POST /actuate route", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { ok: boolean; detail: string };
     expect(body.ok).toBe(false);
-    expect(body.detail).toMatch(/cell-agent \/provision-ssh-keys failed with HTTP 500/);
+    expect(body.detail).toMatch(/gateway cell-agent \/provision-ssh-keys failed with HTTP 500: chroot \/sites\/geelongns missing/);
   });
 
-  it("provision-ssh-keys: reports a clean failure and touches NO cell-agent when CELL_AGENT_URL/TOKEN are missing", async () => {
+  it("provision-ssh-keys: a job without the gateway pair is refused with NO call, even with CELL_AGENT_URL/TOKEN set", async () => {
     vi.setSystemTime(new Date(FREEZE_MS));
-    const job = sshKeysJob();
+    const { gatewayAgentUrl: _url, gatewayAgentToken: _token, ...withoutGateway } = SSH_KEYS_JOB_PARAMS;
+    const job = sshKeysJob({ params: JSON.stringify(withoutGateway) });
     const signature = await signAsApp(job, privateKey);
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
-    const response = await worker.fetch(
-      actuateRequest({ job, signature }),
-      envWith({ CELL_AGENT_URL: undefined, CELL_AGENT_TOKEN: undefined }),
-    );
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
     expect(response.status).toBe(200);
     const body = (await response.json()) as { ok: boolean; detail: string };
     expect(body.ok).toBe(false);
-    expect(body.detail).toMatch(/CELL_AGENT_URL \/ CELL_AGENT_TOKEN are not configured/);
+    expect(body.detail).toMatch(/names no gateway cell-agent/);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -6983,8 +7049,7 @@ describe("POST /actuate route", () => {
     vi.setSystemTime(new Date(FREEZE_MS));
     const job = sshKeysJob({
       params: JSON.stringify({
-        project: "dy-agency-proof",
-        slug: "geelongns",
+        ...SSH_KEYS_JOB_PARAMS,
         authorizedKeys: ["-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"],
       }),
     });
