@@ -2,8 +2,9 @@
 // rules plus the Cloudflare Managed Ruleset.
 //
 // The platform never sends this Worker an expression, an action, a path or a country list. It sends a
-// zone name, an on/off switch, two lists of HOSTS inside that zone and a switch for the Managed
-// Ruleset (dispatch-params.ts::validateWafRuleUpsertParams). THIS module turns them into the rules
+// zone name, an on/off switch, two lists of HOSTS inside that zone, an optional list of `{ host,
+// cookie }` front-end exemptions and a switch for the Managed Ruleset
+// (dispatch-params.ts::validateWafRuleUpsertParams). THIS module turns them into the rules
 // from its own templates and constants. The country lists stay CONSTANTS on purpose: a signed country
 // list could block AU or allow only KP and take every site on the agency's zone offline. A host list
 // cannot do that — the worst a bad one does is exempt an in-zone host from the front-end challenge.
@@ -17,7 +18,9 @@
 //                                except admin-ajax.php and an already-logged-in session.
 //   4. doubleyoup-frontend-geo   MANAGED-CHALLENGE everything else from outside the allow-list, except
 //                                verified search-engine crawlers, the zone's infrastructure hosts
-//                                (`excludedHosts`) and its per-site media hosts (`*-media.<zone>`).
+//                                (`excludedHosts`) and its per-site media hosts (`*-media.<zone>`),
+//                                and, per zone, each `frontendGeoExemptions` entry (hub#598): one
+//                                in-zone host when the request carries a named cookie.
 //   5. the agent skip            SKIP the Managed Ruleset for EVERY request to the cell-agent hosts
 //                                (`agentHosts`). They serve no WordPress: each is a bearer-authenticated
 //                                machine API whose request bodies carry shell commands and presigned
@@ -45,6 +48,14 @@
 // across ALL of that zone's traffic, which is what makes it cover a site served on its own customer
 // domain (a Cloudflare-for-SaaS custom hostname on this zone). The host lists only EXEMPT the zone's
 // own infrastructure. The blast radius is the whole zone, including the agency's own site.
+//
+// FRONT-END GEO EXEMPTIONS ARE NOT AUTHENTICATION (hub#598). An exemption `{ host, cookie }` appends
+// `and not (http.host eq "<host>" and http.cookie contains "<cookie>=")` to the front-end rule only.
+// Any client can send a cookie with that name, so the cookie test is a noise filter: it keeps a
+// casual visitor or scanner without the cookie challenged on that host, nothing more. The worst a
+// forged cookie does is skip the front-end challenge on that one in-zone host, the same worst case
+// as an `excludedHosts` entry. Rules 1-3 run first, so it never opens the login surface. With no
+// exemptions the rule text is byte-identical to the text before hub#598.
 //
 // THE LIVE syd RULES. doubleyoup.com carries these five rules today (applied with the orchestrator's
 // own token). The descriptions here are IDENTICAL, so this op finds them and PATCHes them in place.
@@ -194,6 +205,17 @@ export interface WafRuleSet {
   execSkip: WafRule;
 }
 
+/**
+ * One per-zone front-end geo exemption (hub#598): skip the front-end challenge on `host` when the
+ * request carries a cookie named `cookie`. A noise filter, NOT authentication (see the header).
+ */
+export interface WafFrontendGeoExemption {
+  /** A lowercase host: the zone apex or inside the zone, never in `excludedHosts`. */
+  host: string;
+  /** A cookie name matching `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`. */
+  cookie: string;
+}
+
 /** What the builder needs: the validated params minus the Managed Ruleset switch. */
 export interface WafRuleInput {
   /** The agency zone NAME; it lands in the media-host suffix clause. */
@@ -204,6 +226,11 @@ export interface WafRuleInput {
   excludedHosts: readonly string[];
   /** Cell-agent hosts: every request to them skips the Managed Ruleset. */
   agentHosts: readonly string[];
+  /**
+   * 0..5 front-end geo exemptions, already validated and in the signed order. Absent => none, and
+   * the front-end rule is byte-identical to the text before hub#598.
+   */
+  frontendGeoExemptions?: readonly WafFrontendGeoExemption[];
 }
 
 /**
@@ -348,18 +375,28 @@ export function wafLoginGateExpression(): string {
  * image on a site would break for a visitor outside the allow-list. The suffix keeps the leading "-",
  * so it cannot match the zone apex or a host such as `media.<zone>` (those are listed explicitly when
  * they are infrastructure).
+ *
+ * After the media clause comes one clause per per-zone exemption (hub#598), in the GIVEN order: the
+ * validator already demands a strictly ascending list, so sorting here would hide a caller bug.
+ * With no exemptions nothing is appended. The cookie test is not authentication (see the header).
  */
 export function wafFrontendGeoExpression(
   allowCountries: readonly string[],
   excludedHosts: readonly string[],
   zone: string,
+  exemptions: readonly WafFrontendGeoExemption[] = [],
 ): string {
-  return (
+  let expression =
     `not (${countrySetExpression(allowCountries)}) ` +
     'and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
     `and not (http.host in ${quotedSet(excludedHosts)}) ` +
-    `and not ends_with(http.host, "-media.${escapeRulesString(zone)}")`
-  );
+    `and not ends_with(http.host, "-media.${escapeRulesString(zone)}")`;
+  for (const exemption of exemptions) {
+    const host = escapeRulesString(exemption.host);
+    const cookie = escapeRulesString(exemption.cookie);
+    expression += ` and not (http.host eq "${host}" and http.cookie contains "${cookie}=")`;
+  }
+  return expression;
 }
 
 /**
@@ -389,6 +426,10 @@ export function buildEdgeWafRules(input: WafRuleInput): WafRulesVerdict {
   if (input.agentHosts.length === 0) {
     return { ok: false, reason: "agentHosts is empty — there is no cell-agent host to exempt" };
   }
+  let frontendGeoExemptions: readonly WafFrontendGeoExemption[] = [];
+  if (input.frontendGeoExemptions !== undefined) {
+    frontendGeoExemptions = input.frontendGeoExemptions;
+  }
 
   const rules: WafRuleSet = {
     countryBlock: {
@@ -411,7 +452,7 @@ export function buildEdgeWafRules(input: WafRuleInput): WafRulesVerdict {
     },
     frontendGeo: {
       description: WAF_FRONTEND_GEO_DESCRIPTION,
-      expression: wafFrontendGeoExpression(allowCountries, input.excludedHosts, input.zone),
+      expression: wafFrontendGeoExpression(allowCountries, input.excludedHosts, input.zone, frontendGeoExemptions),
       action: "managed_challenge",
       enabled: input.enabled,
     },

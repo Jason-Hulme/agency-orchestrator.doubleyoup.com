@@ -128,6 +128,7 @@ import {
   wafRuleDrifted,
   wafWpAdminGeoExpression,
   type WafRule,
+  type WafRuleInput,
 } from "../src/edge-waf-rule.js";
 import {
   EDGE_CACHE_BYPASS_RULE_DESCRIPTION,
@@ -1553,6 +1554,96 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
     expect(bad({ includeManagedRuleset: undefined }).ok).toBe(false);
   });
 
+  it("waf-rule-upsert: frontendGeoExemptions — absent and [] mean none; a sorted list comes back as fresh entries (hub#598)", () => {
+    // Absent and [] both validate to exactly the params of a job without the key.
+    expect(validateWafRuleUpsertParams(WAF_RULE_PARAMS)).toEqual({ ok: true, params: WAF_RULE_PARAMS });
+    expect(validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, frontendGeoExemptions: [] })).toEqual({
+      ok: true,
+      params: WAF_RULE_PARAMS,
+    });
+
+    const exemptions = [
+      { host: "dash.example.com", cookie: "__Secure-app.session" },
+      { host: "dash.example.com", cookie: "sid" },
+      { host: "example.com", cookie: "a" },
+      { host: "portal.example.com", cookie: "sid" },
+    ];
+    const verdict = validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, frontendGeoExemptions: exemptions });
+    expect(verdict).toEqual({ ok: true, params: { ...WAF_RULE_PARAMS, frontendGeoExemptions: exemptions } });
+    if (!verdict.ok) throw new Error(verdict.reason);
+    expect(verdict.params.frontendGeoExemptions).not.toBe(exemptions);
+    expect(verdict.params.frontendGeoExemptions?.[0]).not.toBe(exemptions[0]);
+
+    // Five entries is the cap, and a 64-character cookie name is the longest.
+    const five = Array.from({ length: 5 }, (_, index) => ({ host: `h${index}.example.com`, cookie: "c".repeat(64) }));
+    expect(validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, frontendGeoExemptions: five }).ok).toBe(true);
+  });
+
+  it("waf-rule-upsert: frontendGeoExemptions — refuses every bad list (hub#598)", () => {
+    const bad = (frontendGeoExemptions: unknown) => validateWafRuleUpsertParams({ ...WAF_RULE_PARAMS, frontendGeoExemptions });
+    const refusals: Array<{ value: unknown; reason: RegExp }> = [
+      { value: null, reason: /array of 0-5/ },
+      { value: { host: "dash.example.com", cookie: "sid" }, reason: /array of 0-5/ },
+      { value: ["dash.example.com"], reason: /exactly the keys host and cookie/ },
+      // A bad host.
+      { value: [{ host: "Dash.example.com", cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      { value: [{ host: "*.example.com", cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      { value: [{ host: 'a".example.com', cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      { value: [{ host: 42, cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      // A host outside the zone.
+      { value: [{ host: "dash.other.com", cookie: "sid" }], reason: /not the zone apex or inside the zone/ },
+      { value: [{ host: "evilexample.com", cookie: "sid" }], reason: /not the zone apex or inside the zone/ },
+      // A host in excludedHosts.
+      { value: [{ host: "host.example.com", cookie: "sid" }], reason: /is in excludedHosts/ },
+      // A bad cookie name.
+      { value: [{ host: "dash.example.com", cookie: "" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: "-sid" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: ".sid" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: "sid=" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: 'si"d' }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: "s id" }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: "c".repeat(65) }], reason: /cookie must match/ },
+      { value: [{ host: "dash.example.com", cookie: 7 }], reason: /cookie must match/ },
+      // An extra or a missing entry key.
+      { value: [{ host: "dash.example.com", cookie: "sid", expression: "true" }], reason: /unknown key "expression"/ },
+      { value: [{ host: "dash.example.com" }], reason: /cookie must match/ },
+      { value: [{ cookie: "sid" }], reason: /host must be a lowercase hostname/ },
+      // Six entries.
+      {
+        value: Array.from({ length: 6 }, (_, index) => ({ host: `h${index}.example.com`, cookie: "sid" })),
+        reason: /array of 0-5/,
+      },
+      // Unsorted, by host and by cookie.
+      {
+        value: [
+          { host: "portal.example.com", cookie: "sid" },
+          { host: "dash.example.com", cookie: "sid" },
+        ],
+        reason: /strictly ascending/,
+      },
+      {
+        value: [
+          { host: "dash.example.com", cookie: "sid" },
+          { host: "dash.example.com", cookie: "__Secure-app.session" },
+        ],
+        reason: /strictly ascending/,
+      },
+      // A duplicate.
+      {
+        value: [
+          { host: "dash.example.com", cookie: "sid" },
+          { host: "dash.example.com", cookie: "sid" },
+        ],
+        reason: /strictly ascending/,
+      },
+    ];
+    for (const refusal of refusals) {
+      const verdict = bad(refusal.value);
+      if (verdict.ok) throw new Error(`accepted: ${JSON.stringify(refusal.value)}`);
+      expect(verdict.reason).toMatch(refusal.reason);
+    }
+  });
+
   // ── waf-rule-upsert: the rule BUILDER (byte-identical twin of the orchestrator's) ──
   // Every expression below is pinned character for character, and the orchestrator's
   // src/edge-waf-rule.test.ts pins the SAME text, so a change on one side of the twin breaks that
@@ -1600,7 +1691,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
   };
 
   /** The five rules the Worker must build for `input`, or a thrown reason. */
-  function builtWafRules(input: { zone: string; enabled: boolean; excludedHosts: string[]; agentHosts: string[] } = WAF_BUILD_INPUT) {
+  function builtWafRules(input: WafRuleInput = WAF_BUILD_INPUT) {
     const built = buildEdgeWafRules(input);
     if (!built.ok) throw new Error(built.reason);
     return built.rules;
@@ -1688,6 +1779,80 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       'not (ip.geoip.country in {"AU"}) and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
         'and not (http.host in {"cell-x.sbmstudio.com.au"}) and not ends_with(http.host, "-media.sbmstudio.com.au")',
     );
+  });
+
+  // hub#598: the three pinned front-end strings. The orchestrator's twin test pins the SAME text.
+  const PINNED_FRONTEND_GEO_NO_EXEMPTIONS =
+    'not (ip.geoip.country in {"AU"}) and not (cf.verified_bot_category eq "Search Engine Crawler") ' +
+    'and not (http.host in {"cell-x.example.com"}) and not ends_with(http.host, "-media.example.com")';
+  const PINNED_FRONTEND_GEO_ONE_EXEMPTION =
+    PINNED_FRONTEND_GEO_NO_EXEMPTIONS +
+    ' and not (http.host eq "dash.example.com" and http.cookie contains "__Secure-app.session=")';
+  const PINNED_FRONTEND_GEO_TWO_EXEMPTIONS =
+    PINNED_FRONTEND_GEO_ONE_EXEMPTION + ' and not (http.host eq "portal.example.com" and http.cookie contains "sid=")';
+  const DASH_EXEMPTION = { host: "dash.example.com", cookie: "__Secure-app.session" };
+  const PORTAL_EXEMPTION = { host: "portal.example.com", cookie: "sid" };
+
+  it("waf-rule-upsert: frontendGeoExemptions append one clause each, in the given order — the pinned twin text (hub#598)", () => {
+    expect(wafFrontendGeoExpression(["AU"], ["cell-x.example.com"], "example.com")).toBe(PINNED_FRONTEND_GEO_NO_EXEMPTIONS);
+    expect(wafFrontendGeoExpression(["AU"], ["cell-x.example.com"], "example.com", [])).toBe(PINNED_FRONTEND_GEO_NO_EXEMPTIONS);
+    expect(wafFrontendGeoExpression(["AU"], ["cell-x.example.com"], "example.com", [DASH_EXEMPTION])).toBe(
+      PINNED_FRONTEND_GEO_ONE_EXEMPTION,
+    );
+    expect(wafFrontendGeoExpression(["AU"], ["cell-x.example.com"], "example.com", [DASH_EXEMPTION, PORTAL_EXEMPTION])).toBe(
+      PINNED_FRONTEND_GEO_TWO_EXEMPTIONS,
+    );
+    // The builder does not sort: the validator demands the order, so the builder keeps what it got.
+    expect(wafFrontendGeoExpression(["AU"], ["cell-x.example.com"], "example.com", [PORTAL_EXEMPTION, DASH_EXEMPTION])).toBe(
+      PINNED_FRONTEND_GEO_NO_EXEMPTIONS +
+        ' and not (http.host eq "portal.example.com" and http.cookie contains "sid=")' +
+        ' and not (http.host eq "dash.example.com" and http.cookie contains "__Secure-app.session=")',
+    );
+  });
+
+  it("waf-rule-upsert: absent and [] exemptions build today's five rules; a list changes the front-end rule ONLY (hub#598)", () => {
+    const today = builtWafRules();
+    const empty = buildEdgeWafRules({ ...WAF_BUILD_INPUT, frontendGeoExemptions: [] });
+    if (!empty.ok) throw new Error(empty.reason);
+    expect(empty.rules).toEqual(today);
+    expect(today.frontendGeo.expression).toBe(EXPECTED_FRONTEND_GEO_EXPRESSION);
+
+    const withList = buildEdgeWafRules({ ...WAF_BUILD_INPUT, frontendGeoExemptions: [DASH_EXEMPTION, PORTAL_EXEMPTION] });
+    if (!withList.ok) throw new Error(withList.reason);
+    expect(withList.rules.frontendGeo.expression).toBe(
+      EXPECTED_FRONTEND_GEO_EXPRESSION +
+        ' and not (http.host eq "dash.example.com" and http.cookie contains "__Secure-app.session=")' +
+        ' and not (http.host eq "portal.example.com" and http.cookie contains "sid=")',
+    );
+    // Country lists, block rule, wp-admin geo, login gate, agent skip and the order do not move.
+    expect(withList.rules.countryBlock).toEqual(today.countryBlock);
+    expect(withList.rules.wpAdminGeo).toEqual(today.wpAdminGeo);
+    expect(withList.rules.loginGate).toEqual(today.loginGate);
+    expect(withList.rules.execSkip).toEqual(today.execSkip);
+    expect({ ...withList.rules.frontendGeo, expression: "" }).toEqual({ ...today.frontendGeo, expression: "" });
+    expect(edgeWafRulesInOrder(withList.rules).map((rule) => rule.description)).toEqual(
+      edgeWafRulesInOrder(today).map((rule) => rule.description),
+    );
+  });
+
+  it("waf-rule-upsert: the 4,096-character check covers the exemption clauses (hub#598)", () => {
+    // Hosts that fit alone, but not with five long exemptions appended.
+    const hosts = Array.from({ length: 70 }, (_, index) => `a-rather-long-infrastructure-host-${index}.example.com`);
+    expect(buildEdgeWafRules({ ...WAF_BUILD_INPUT, excludedHosts: hosts, agentHosts: [hosts[0] as string] }).ok).toBe(true);
+    const exemptions = Array.from({ length: 5 }, (_, index) => ({
+      host: `${"x".repeat(60)}-${index}.example.com`,
+      cookie: "c".repeat(64),
+    }));
+    const verdict = buildEdgeWafRules({
+      ...WAF_BUILD_INPUT,
+      excludedHosts: hosts,
+      agentHosts: [hosts[0] as string],
+      frontendGeoExemptions: exemptions,
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/doubleyoup-frontend-geo/);
+    }
   });
 
   it("waf-rule-upsert: enabled:false switches the four PROTECTIONS off in place — never the /exec skip", () => {
@@ -6644,6 +6809,55 @@ describe("POST /actuate route", () => {
     const body = (await response.json()) as { reason: string };
     expect(body.reason).toMatch(/unknown param "blockCountries"/);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("waf-rule-upsert: every bad frontendGeoExemptions list is a 400 that reaches NO Cloudflare API (hub#598)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const badLists: unknown[] = [
+      [{ host: "Dash.example.com", cookie: "sid" }], // a bad host
+      [{ host: "dash.other.com", cookie: "sid" }], // outside the zone
+      [{ host: "host.example.com", cookie: "sid" }], // in excludedHosts
+      [{ host: "dash.example.com", cookie: "sid=" }], // a bad cookie name
+      [{ host: "dash.example.com", cookie: "sid", action: "skip" }], // an extra entry key
+      Array.from({ length: 6 }, (_, index) => ({ host: `h${index}.example.com`, cookie: "sid" })), // 6 entries
+      [
+        { host: "portal.example.com", cookie: "sid" },
+        { host: "dash.example.com", cookie: "sid" },
+      ], // unsorted
+      [
+        { host: "dash.example.com", cookie: "sid" },
+        { host: "dash.example.com", cookie: "sid" },
+      ], // a duplicate
+    ];
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    for (const frontendGeoExemptions of badLists) {
+      const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, frontendGeoExemptions }) });
+      const signature = await signAsApp(job, privateKey);
+      const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+      expect(response.status, JSON.stringify(frontendGeoExemptions)).toBe(400);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("waf-rule-upsert: a valid frontendGeoExemptions list lands in the front-end rule it writes (hub#598)", async () => {
+    vi.setSystemTime(new Date(FREEZE_MS));
+    const frontendGeoExemptions = [
+      { host: "dash.example.com", cookie: "__Secure-app.session" },
+      { host: "portal.example.com", cookie: "sid" },
+    ];
+    const job = wafRuleJob({ params: JSON.stringify({ ...WAF_RULE_PARAMS, frontendGeoExemptions }) });
+    const signature = await signAsApp(job, privateKey);
+    const calls = mockWafRuleApi(null);
+
+    const response = await worker.fetch(actuateRequest({ job, signature }), envWith());
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, op: "waf-rule-upsert" });
+    const frontendWrite = calls.find((call) => call.method !== "GET" && call.body?.description === WAF_FRONTEND_GEO_DESCRIPTION);
+    expect(frontendWrite?.body?.expression).toBe(
+      expectedWafRules()[3]?.expression +
+        ' and not (http.host eq "dash.example.com" and http.cookie contains "__Secure-app.session=")' +
+        ' and not (http.host eq "portal.example.com" and http.cookie contains "sid=")',
+    );
   });
 
   it("waf-rule-upsert: an over-long host list is refused before ANY Cloudflare call", async () => {
