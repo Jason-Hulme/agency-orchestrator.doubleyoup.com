@@ -175,7 +175,7 @@ npm run deploy
 | `GET /whoami` | exercise Direction-A end-to-end; returns `{ok, accountId}` |
 | `POST /complete` | if all green, call our app's onboarding-complete route; returns `{ok, validation, callback}` |
 | `POST /actuate` | runs one signed Direction-B job (ed25519 signature and a single-use nonce). Only the platform calls it |
-| `POST /media/sign-put`, `/media/replace`, `/media/delete`, `/media/rename` | hub#222: the site-facing media API. Only a site's mu-plugin calls it, with its own credential (see [Media soft delete](#media-soft-delete)) |
+| `POST /media/sign-put`, `/media/replace`, `/media/delete`, `/media/rename`, `/media/list` | hub#222: the site-facing media API. Only a site's mu-plugin calls it, with its own credential (see [Media soft delete](#media-soft-delete)) |
 
 > `POST /complete` re-validates and calls our app's `onboarding-complete` route
 > (now live). It stays resilient — if that callback is ever unreachable it still
@@ -230,6 +230,7 @@ never hold a `.` or `..` segment. Rate limit: 600 requests a minute per bucket
 | `/media/replace` | `{bucket, key, contentType, contentLength}` | Moves the current object to trash, deletes it, then returns a create-once `upload` for the key. No current object: `previous: "already-absent"` |
 | `/media/delete` | `{bucket, key}` | Moves the object to trash, then deletes it. Missing: `status: "already-absent"` (ok) |
 | `/media/rename` | `{bucket, from, to}` | Copies `from` to `to` (409 when `to` holds another revision, also one uploaded during the rename), moves `from` to trash, deletes `from`. Missing `from`: `already-absent` (ok) |
+| `/media/list` | `{bucket, prefix, cursor?, startAfter?, maxKeys?}` | hub#588, read-only: one page of the site's live keys, `{ok, action: "list", entries: [{key, size}], nextCursor}`. `prefix` is `<prefix>/` or a folder under it, ending in `/`, never `<prefix>/trash/`. `cursor` is the `nextCursor` of the previous page (null = last page). `startAfter` is a key under `<prefix>/`. `maxKeys` is 1 to 1000 (default 1000). Keys under `trash/` or `<prefix>/trash/` are never returned. No lease, no write |
 
 Each route is safe to retry. A trash copy keeps the metadata
 (`x-amz-metadata-directive: COPY`) and is taken only while the source still has

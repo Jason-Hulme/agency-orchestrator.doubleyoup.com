@@ -408,13 +408,17 @@ function decodeXmlText(text: string): string {
   });
 }
 
-/** One ListObjectsV2 page under `prefix`. */
+/**
+ * One ListObjectsV2 page under `prefix`. `startAfter` (optional) lists only keys that sort after it; S3 ignores it
+ * once a continuation token is sent.
+ */
 export async function listMediaObjects(
   identity: MediaStoreIdentity,
   bucket: string,
   prefix: string,
   maxKeys: number,
   cursor?: string,
+  startAfter?: string,
 ): Promise<{ entries: MediaTrashEntry[]; nextCursor: string | null } | { error: string }> {
   const query = new URLSearchParams();
   query.set("list-type", "2");
@@ -422,6 +426,9 @@ export async function listMediaObjects(
   query.set("max-keys", String(maxKeys));
   if (cursor !== undefined) {
     query.set("continuation-token", cursor);
+  }
+  if (startAfter !== undefined) {
+    query.set("start-after", startAfter);
   }
   const url = `${identity.endpoint}/${awsUriEncodeComponent(bucket)}?${query.toString()}`;
   const response = await sendSigned(identity, "GET", url);
