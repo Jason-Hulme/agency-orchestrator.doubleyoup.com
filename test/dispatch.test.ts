@@ -1248,6 +1248,7 @@ describe("per-op params validation (Worker side — twin of the app's rules)", (
       "gcp-instance-remove-service-account",
       "gcp-instance-restart",
       "gcp-instance-set-metadata",
+      "gcp-instance-startup-script-pin",
       "gcp-instances-list",
       "gcp-network-create",
       "gcp-network-delete",

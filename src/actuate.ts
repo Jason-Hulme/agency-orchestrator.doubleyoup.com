@@ -154,6 +154,7 @@ import type {
 } from "./actuate-branded-media.js";
 import type { CfTunnelConnectionsGetResult, CfTunnelTokenGetResult, GcpInstanceMetadataDiffResult } from "./actuate-p47.js";
 import type { EdgeGateDeployResult } from "./actuate-edge-gate.js";
+import type { GcpInstanceStartupScriptPinResult } from "./actuate-startup-script-pin.js";
 import type {
   MediaBucketProtectResult,
   MediaBulkCredentialResult,
@@ -870,6 +871,8 @@ export type ActuateResult =
   | CfTunnelTokenGetResult
   | CfTunnelConnectionsGetResult
   | GcpInstanceMetadataDiffResult
+  // hub#340 (actuate-startup-script-pin.ts): the guarded boot-pin write.
+  | GcpInstanceStartupScriptPinResult
   | GcpDiskSnapshotCreateResult
   | GcpInstanceRemoveServiceAccountResult
   // hub#43 (actuate-r2-media.ts): agency-owned media.
@@ -7018,6 +7021,107 @@ export function mergeMetadataItems(
 // write is reported `unconfirmed` for the caller to re-run (idempotent), never assumed in place.
 const INSTANCE_SET_METADATA_WAIT_ATTEMPTS = 1;
 
+/** What one guarded instances.setMetadata write ended as. Details carry key names and HTTP facts, never a value. */
+export type InstanceMetadataWriteOutcome =
+  | { ok: true; operationName: string }
+  | { ok: false; detail: string; staleFingerprint?: true; unconfirmed?: true };
+
+/**
+ * POST instances.setMetadata with the fingerprint of the caller's own read, ONCE, and wait (bounded) for
+ * the zonal operation. Shared by gcp-instance-set-metadata and gcp-instance-startup-script-pin, so both
+ * write under exactly the same rules:
+ *   - 412 is Google's stale-fingerprint answer: `staleFingerprint`, nothing written, and NO re-read or
+ *     re-write here — the caller decides whether to run again against the new state.
+ *   - a fetch that throws, a 5xx, a 2xx without an Operation, or an operation not DONE in the bounded
+ *     wait is `unconfirmed`: the write may be in place (planning/47 review L1).
+ *   - any other non-2xx is a plain failure.
+ */
+export async function postInstanceMetadata(input: {
+  zonePath: string;
+  instanceUrl: string;
+  accessToken: string;
+  what: string;
+  project: string;
+  fingerprint: string;
+  items: ComputeMetadataItem[];
+}): Promise<InstanceMetadataWriteOutcome> {
+  const { zonePath, instanceUrl, accessToken, what, project, fingerprint, items } = input;
+
+  let response: Response;
+  try {
+    response = await fetch(`${instanceUrl}/setMetadata`, {
+      method: "POST",
+      headers: gcpHeaders(accessToken),
+      body: JSON.stringify({ fingerprint, items }),
+    });
+  } catch (err) {
+    // planning/47 review L1: a fetch that throws may have thrown AFTER the request reached Google, so
+    // the write may be in place. UNKNOWN, never "nothing was written": re-read before deciding.
+    return {
+      ok: false,
+      detail: `the setMetadata call on ${what} failed in transit (${errorMessage(err)}): it may or may not have been written — read the instance before anything else.`,
+      unconfirmed: true,
+    };
+  }
+  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
+
+  if (response.status === 412) {
+    // Google's conditionNotMet: the metadata changed under us. Surface it discriminably; do NOT
+    // re-read and re-write here — the caller decides whether to re-run against the new state.
+    return {
+      ok: false,
+      detail:
+        `the metadata of ${what} changed between read and write (HTTP 412, stale fingerprint)${googleErrorMessage(body)} — ` +
+        "nothing was written; re-run to merge against the current metadata.",
+      staleFingerprint: true,
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      detail:
+        `Google Cloud denied setting metadata on ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
+        `needs compute.instances.setMetadata (e.g. roles/compute.instanceAdmin.v1) on project "${project}".`,
+    };
+  }
+  if (response.status >= 500) {
+    // planning/47 review L1: Google's 5xx does not say the write did not happen.
+    return {
+      ok: false,
+      detail: `setting metadata on ${what} answered HTTP ${response.status}${googleErrorMessage(body)}: it may or may not have been written — read the instance before anything else.`,
+      unconfirmed: true,
+    };
+  }
+  if (!response.ok) {
+    return { ok: false, detail: `setting metadata on ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}.` };
+  }
+
+  // A 2xx must carry an Operation. Without one we cannot confirm the write was accepted — but Google
+  // may well have accepted it, so this is `unconfirmed` (re-run converges), not an observed failure.
+  const operationName = body?.name;
+  if (!operationName) {
+    return {
+      ok: false,
+      detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the metadata write on ${what} was accepted.`,
+      unconfirmed: true,
+    };
+  }
+  const waited = await waitForComputeOperation({
+    waitUrl: `${zonePath}/operations/${encodeURIComponent(operationName)}/wait`,
+    accessToken,
+    what,
+    maxAttempts: INSTANCE_SET_METADATA_WAIT_ATTEMPTS,
+    verb: "metadata write",
+  });
+  if (!waited.ok && waited.completed) {
+    return { ok: false, detail: waited.detail };
+  }
+  if (!waited.ok) {
+    return { ok: false, detail: waited.detail, unconfirmed: true };
+  }
+  return { ok: true, operationName };
+}
+
 export async function actuateGcpInstanceSetMetadata(
   params: GcpInstanceSetMetadataParams,
   env: Env,
@@ -7094,84 +7198,18 @@ export async function actuateGcpInstanceSetMetadata(
   const mergedItems = mergeMetadataItems(existingItems, renderedItems);
 
   // Step 4 — write back under the fingerprint we read, then confirm the operation.
-  let response: Response;
-  try {
-    response = await fetch(`${instanceUrl}/setMetadata`, {
-      method: "POST",
-      headers: gcpHeaders(accessToken),
-      body: JSON.stringify({ fingerprint, items: mergedItems }),
-    });
-  } catch (err) {
-    // planning/47 review L1: a fetch that throws may have thrown AFTER the request reached Google, so
-    // the write may be in place. UNKNOWN, never "nothing was written": re-read before deciding.
-    return {
-      ok: false,
-      op: "gcp-instance-set-metadata",
-      instanceName,
-      detail: `the setMetadata call on ${what} failed in transit (${errorMessage(err)}): it may or may not have been written — read the instance before anything else.`,
-      unconfirmed: true,
-    };
+  const written = await postInstanceMetadata({ zonePath, instanceUrl, accessToken, what, project, fingerprint, items: mergedItems });
+  if (!written.ok) {
+    const writeFailure: GcpInstanceSetMetadataResult = { ok: false, op: "gcp-instance-set-metadata", instanceName, detail: written.detail };
+    if (written.staleFingerprint === true) {
+      writeFailure.staleFingerprint = true;
+    }
+    if (written.unconfirmed === true) {
+      writeFailure.unconfirmed = true;
+    }
+    return writeFailure;
   }
-  const body = (await response.json().catch(() => null)) as ComputeInsertResponse | null;
-
-  if (response.status === 412) {
-    // Google's conditionNotMet: the metadata changed under us. Surface it discriminably; do NOT
-    // re-read and re-write here — the caller decides whether to re-run against the new state.
-    return {
-      ok: false,
-      op: "gcp-instance-set-metadata",
-      instanceName,
-      detail:
-        `the metadata of ${what} changed between read and write (HTTP 412, stale fingerprint)${googleErrorMessage(body)} — ` +
-        "nothing was written; re-run to merge against the current metadata.",
-      staleFingerprint: true,
-    };
-  }
-  if (response.status === 401 || response.status === 403) {
-    return failure(
-      `Google Cloud denied setting metadata on ${what} (HTTP ${response.status})${googleErrorMessage(body)} — the service account ` +
-        `needs compute.instances.setMetadata (e.g. roles/compute.instanceAdmin.v1) on project "${project}".`,
-    );
-  }
-  if (response.status >= 500) {
-    // planning/47 review L1: Google's 5xx does not say the write did not happen.
-    return {
-      ok: false,
-      op: "gcp-instance-set-metadata",
-      instanceName,
-      detail: `setting metadata on ${what} answered HTTP ${response.status}${googleErrorMessage(body)}: it may or may not have been written — read the instance before anything else.`,
-      unconfirmed: true,
-    };
-  }
-  if (!response.ok) {
-    return failure(`setting metadata on ${what} failed with HTTP ${response.status}${googleErrorMessage(body)}.`);
-  }
-
-  // A 2xx must carry an Operation. Without one we cannot confirm the write was accepted — but Google
-  // may well have accepted it, so this is `unconfirmed` (re-run converges), not an observed failure.
-  const operationName = body?.name;
-  if (!operationName) {
-    return {
-      ok: false,
-      op: "gcp-instance-set-metadata",
-      instanceName,
-      detail: `Compute Engine returned HTTP ${response.status} but no operation — cannot confirm the metadata write on ${what} was accepted.`,
-      unconfirmed: true,
-    };
-  }
-  const waited = await waitForComputeOperation({
-    waitUrl: `${zonePath}/operations/${encodeURIComponent(operationName)}/wait`,
-    accessToken,
-    what,
-    maxAttempts: INSTANCE_SET_METADATA_WAIT_ATTEMPTS,
-    verb: "metadata write",
-  });
-  if (!waited.ok && waited.completed) {
-    return failure(waited.detail);
-  }
-  if (!waited.ok) {
-    return { ok: false, op: "gcp-instance-set-metadata", instanceName, detail: waited.detail, unconfirmed: true };
-  }
+  const operationName = written.operationName;
 
   return {
     ok: true,
