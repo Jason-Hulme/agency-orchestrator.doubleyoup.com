@@ -2699,6 +2699,7 @@ export async function actuateWafRuleUpsert(params: WafRuleUpsertParams, env: Env
     enabled: params.enabled,
     excludedHosts: params.excludedHosts,
     agentHosts: params.agentHosts,
+    frontendGeoExemptions: params.frontendGeoExemptions,
   });
   if (!built.ok) {
     return wafFailure(zoneName, built.reason);
@@ -3223,6 +3224,7 @@ async function syncCustomRules(
     enabled: params.baseline.enabled,
     excludedHosts: params.baseline.excludedHosts,
     agentHosts: params.baseline.agentHosts,
+    frontendGeoExemptions: params.baseline.frontendGeoExemptions,
   });
   if (!builtBaseline.ok) {
     return wafEdgeSyncRefusal(zoneName, "invalid", builtBaseline.reason);

@@ -391,7 +391,9 @@ describe("mintSessionGateIdToken: the caller proof (gate v2)", () => {
       { name: "the key of another region's gate", request: await proofRequest(otherRegionKey, audience, now) },
       { name: "the key of another project's gate", request: await proofRequest(otherProjectKey, audience, now) },
       { name: "a stale ts (61 s old)", request: await proofRequest(rightKey, audience, now - 61) },
-      { name: "a future ts (61 s ahead)", request: await proofRequest(rightKey, audience, now + 61) },
+      // The future margin must be well above the 60 s window: a second-boundary tick between
+      // `now` here and the minter's own clock check would bring a +61 ts inside the window.
+      { name: "a future ts (120 s ahead)", request: await proofRequest(rightKey, audience, now + 120) },
       { name: "a MAC for another audience", request: { ...(await proofRequest(rightKey, audienceFor("pma-other"), now)), audience } },
       { name: "a MAC for another ts", request: { ...valid, ts: now - 1 } },
       { name: "DY_CLIENT_SECRET's own text as the key", request: await proofRequest(new TextEncoder().encode(CLIENT_SECRET), audience, now) },
