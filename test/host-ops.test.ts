@@ -43,7 +43,7 @@ import {
   sealHostAgentBody,
   HOST_INSTALL_STUB,
 } from "../src/actuate-host.js";
-import { decodeEnrolFacts, manualEnrolCommand } from "../src/enroll-host.js";
+import { manualEnrolCommand, validateEnrolFactsObject } from "../src/enroll-host.js";
 import { hexEncode } from "../src/ssh-wire.js";
 
 const hostParamsSource: string = rawHostParamsSource as string;
@@ -370,7 +370,6 @@ describe("host-agent sealed requests", () => {
 
 describe("/enroll-host", () => {
   const FACTS = { cellId: CELL_ID, label: "office", subnet: "10.40.3.0/24", networkName: "dy-cell-office", sftpPort: 2222, hostAgentHost: "cell-office-host.agency.example", tunnelId: TUNNEL_ID };
-  const BLOB = `dyenrol2.${btoa(JSON.stringify(FACTS)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
   const CODE = "c".repeat(64);
   const CONNECTOR_TOKEN = btoa(JSON.stringify({ a: "acct", t: TUNNEL_ID, s: "c2VjcmV0" }));
   const PIN = { HOST_INSTALLER_ORIGIN: "https://bundles.example", HOST_INSTALLER_SHA256S: `${"b".repeat(64)},${INSTALLER_SHA}` };
@@ -417,9 +416,22 @@ describe("/enroll-host", () => {
     expect(response.status).toBe(200);
     const html = await response.text();
     expect(html).toContain(`https://bundles.example/self-hosted/host-install-${INSTALLER_SHA}.sh`);
-    expect(html).toContain("https://agency-worker.example/enroll-host");
+    // The installer adds /enroll-host itself and refuses an origin with a path: the command holds the bare origin.
+    expect(html).toContain("--enroll &#39;https://agency-worker.example&#39;");
+    expect(html).not.toContain("agency-worker.example/enroll-host");
     expect(html).not.toContain("b".repeat(64));
-    expect(manualEnrolCommand(`https://bundles.example/self-hosted/host-install-${INSTALLER_SHA}.sh`, INSTALLER_SHA, "https://w.example/enroll-host")).toContain(`[ "$s" = '${INSTALLER_SHA}' ]`);
+    expect(html).not.toContain("DY_ENROLL_URL");
+    expect(html).not.toContain('sh "$f"');
+  });
+
+  it("the command runs the pinned installer with bash, through sudo unless root or macOS", () => {
+    const command = manualEnrolCommand(`https://bundles.example/self-hosted/host-install-${INSTALLER_SHA}.sh`, INSTALLER_SHA, "https://w.example");
+    expect(command).toContain(`[ "$s" = '${INSTALLER_SHA}' ]`);
+    expect(command).toContain(`if [ "$(id -u)" -eq 0 ] || [ "$(uname -s)" = Darwin ]; then bash "$f" --enroll 'https://w.example'; else sudo bash "$f" --enroll 'https://w.example'; fi`);
+    expect(command).toContain('rm -f "$f"');
+    expect(command).not.toContain("DY_ENROLL_URL");
+    expect(command).not.toContain('sh "$f"; ');
+    expect(command).not.toMatch(/(^|[^a-z])sh "\$f"/);
   });
 
   it("GET shows no command when the installer is not pinned", async () => {
@@ -432,18 +444,26 @@ describe("/enroll-host", () => {
     mockTunnelToken();
     const store = memoryStore();
     const environment = env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding });
-    const first = await post({ enrolCode: CODE, enrolFacts: BLOB }, environment);
+    const first = await post({ facts: FACTS, code: CODE }, environment);
     expect(first.status).toBe(200);
-    const body = (await first.json()) as { ok: boolean; job: Record<string, unknown> };
-    expect(body.job).toMatchObject({
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    const body = (await first.json()) as { ok: boolean; params: Record<string, unknown>; hostAgentToken: string; tunnelToken: string };
+    const expectedToken = hexEncode(await deriveHostAgentToken(MASTER_KEY, CELL_ID));
+    expect(body.ok).toBe(true);
+    expect(body.params).toEqual({
       ...FACTS,
       op: "host-enroll",
       mode: "start",
+      installerUrl: `https://bundles.example/self-hosted/host-install-${INSTALLER_SHA}.sh`,
       installerSha256: INSTALLER_SHA,
-      hostAgentToken: hexEncode(await deriveHostAgentToken(MASTER_KEY, CELL_ID)),
-      tunnelToken: CONNECTOR_TOKEN,
     });
-    const second = await post({ enrolCode: CODE, enrolFacts: BLOB }, environment);
+    expect(body.hostAgentToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.hostAgentToken).toBe(expectedToken);
+    expect(body.tunnelToken).toBe(CONNECTOR_TOKEN);
+    // The tokens are top-level keys only; the installer would otherwise copy them out of params by accident.
+    expect(body.params).not.toHaveProperty("hostAgentToken");
+    expect(body.params).not.toHaveProperty("tunnelToken");
+    const second = await post({ facts: FACTS, code: CODE }, environment);
     expect(second.status).toBe(409);
     expect(await second.json()).toMatchObject({ code: "enroll-code-used" });
   });
@@ -452,13 +472,19 @@ describe("/enroll-host", () => {
     const fetchSpy = mockTunnelToken();
     const store = memoryStore();
     const environment = env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding });
-    const wrong = await post({ enrolCode: "d".repeat(64), enrolFacts: BLOB }, environment);
+    const wrong = await post({ facts: FACTS, code: "d".repeat(64) }, environment);
     expect(wrong.status).toBe(401);
-    expect(await wrong.text()).not.toContain("hostAgentToken");
-    const unset = await post({ enrolCode: CODE, enrolFacts: BLOB }, env({ ...PIN, NONCE_STORE: store.binding }));
+    const wrongText = await wrong.text();
+    expect(wrongText).not.toContain("hostAgentToken");
+    expect(wrongText).not.toContain("tunnelToken");
+    const unset = await post({ facts: FACTS, code: CODE }, env({ ...PIN, NONCE_STORE: store.binding }));
     expect(unset.status).toBe(503);
-    const badFacts = await post({ enrolCode: CODE, enrolFacts: "dyenrol2.e30" }, environment);
+    expect(await unset.text()).not.toContain("hostAgentToken");
+    const badFacts = await post({ facts: {}, code: CODE }, environment);
     expect(badFacts.status).toBe(400);
+    const badFactsText = await badFacts.text();
+    expect(badFactsText).not.toContain("hostAgentToken");
+    expect(badFactsText).not.toContain("tunnelToken");
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(store.used.size).toBe(0);
   });
@@ -471,15 +497,42 @@ describe("/enroll-host", () => {
       return Response.json({ success: false, errors: [{ message: "tunnel not found" }] }, { status: 404 });
     });
     const store = memoryStore();
-    const response = await post({ enrolCode: CODE, enrolFacts: BLOB }, env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding }));
+    const response = await post({ facts: FACTS, code: CODE }, env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding }));
     expect(response.status).toBe(502);
     expect(store.used.size).toBe(0);
   });
 
-  it("decodeEnrolFacts refuses unknown fields and a wrong prefix", () => {
-    expect(decodeEnrolFacts(BLOB)).toEqual({ ok: true, facts: FACTS });
-    expect(decodeEnrolFacts(`dyenrol1.${BLOB.slice(9)}`).ok).toBe(false);
-    const extra = `dyenrol2.${btoa(JSON.stringify({ ...FACTS, hostAgentToken: "x" })).replace(/=+$/, "")}`;
-    expect(decodeEnrolFacts(extra).ok).toBe(false);
+  it("POST refuses a facts object with an unknown key and burns no code", async () => {
+    const fetchSpy = mockTunnelToken();
+    const store = memoryStore();
+    const environment = env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding });
+    const response = await post({ facts: { ...FACTS, hostAgentToken: "x" }, code: CODE }, environment);
+    expect(response.status).toBe(400);
+    const text = await response.text();
+    expect(text).toContain("bad-facts");
+    expect(text).toContain("hostAgentToken");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(store.used.size).toBe(0);
+  });
+
+  it("POST refuses facts that are not an object, and the old { enrolCode, enrolFacts } body", async () => {
+    const fetchSpy = mockTunnelToken();
+    const store = memoryStore();
+    const environment = env({ ...PIN, HOST_ENROLL_CODE: CODE, CF_DNS_API_TOKEN: "cf", NONCE_STORE: store.binding });
+    for (const badFacts of ["dyenrol2.e30", ["x"], null, 7]) {
+      const response = await post({ facts: badFacts, code: CODE }, environment);
+      expect(response.status).toBe(400);
+    }
+    const oldShape = await post({ enrolCode: CODE, enrolFacts: "dyenrol2.e30" }, environment);
+    expect(oldShape.status).toBe(401);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(store.used.size).toBe(0);
+  });
+
+  it("validateEnrolFactsObject accepts the seven facts only", () => {
+    expect(validateEnrolFactsObject(FACTS)).toEqual({ ok: true, facts: FACTS });
+    expect(validateEnrolFactsObject({ ...FACTS, hostAgentToken: "x" }).ok).toBe(false);
+    expect(validateEnrolFactsObject({ ...FACTS, networkName: "dy-cell-other" }).ok).toBe(false);
+    expect(validateEnrolFactsObject([FACTS]).ok).toBe(false);
   });
 });

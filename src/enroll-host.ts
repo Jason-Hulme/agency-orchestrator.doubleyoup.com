@@ -6,11 +6,13 @@
 //                       sha256 from HOST_INSTALLER_ORIGIN / HOST_INSTALLER_SHA256S (the last entry), and the post
 //                       target from this request's own origin. The app shows no command, so a compromised
 //                       platform cannot point the agency at other root code or at a host of its own.
-//   POST /enroll-host   the installer posts { enrolCode, enrolFacts }. enrolCode is the agency's one-time Worker
-//                       secret HOST_ENROLL_CODE; enrolFacts is the non-secret `dyenrol2.<base64url(JSON)>` blob the
-//                       app shows. On success the Worker returns the bootstrap material: the installer job line
-//                       (the same JSON the SSH path pipes in), with the host-agent token and the tunnel connector
-//                       token. Then the code is spent: a second use gets 409.
+//   POST /enroll-host   the installer (`host-install.sh --enroll <origin>`) posts { "facts": <JSON object>, "code":
+//                       <string> }. It decodes the app's `dyenrol2.<base64url(JSON)>` text itself, so the Worker gets
+//                       the facts as an object. code is the agency's one-time Worker secret HOST_ENROLL_CODE. On
+//                       success the Worker answers what the installer reads (host-install.sh, enroll_and_build_params):
+//                       { ok, params, hostAgentToken, tunnelToken }. params holds the seven facts, op, mode and the
+//                       pinned installer; the two tokens are top-level keys, never inside params. Then the code is
+//                       spent: a second use gets 409.
 //
 // Order of the checks on POST, each refusal with nothing returned: code configured (503), code equal in constant
 // time (401), facts valid (400), the tunnel is one of this Worker's own account (its connector token is readable,
@@ -19,12 +21,11 @@
 
 import type { Env } from "./env.js";
 import { enrolFactsVerdict, HOST_ENROL_FACT_KEYS, type HostEnrolFacts } from "./dispatch-params-host.js";
-import { deriveHostAgentToken, fetchConnectorToken, hostAgentMasterKey, installerJobLine, pinnedInstallerUrl, readInstallerPin } from "./actuate-host.js";
-import { base64Decode, bytesEqual, hexEncode, sha256Bytes, utf8Bytes, utf8Text } from "./ssh-wire.js";
+import { deriveHostAgentToken, fetchConnectorToken, hostAgentMasterKey, pinnedInstallerUrl, readInstallerPin } from "./actuate-host.js";
+import { bytesEqual, hexEncode, sha256Bytes, utf8Bytes } from "./ssh-wire.js";
 
 export const ENROLL_HOST_PATH = "/enroll-host";
 export const HOST_ENROLL_CODE_MIN_LENGTH = 32;
-export const ENROL_FACTS_PREFIX = "dyenrol2.";
 const ENROLL_NONCE_INSTANCE = "host-enroll";
 const ENROLL_CODE_RETENTION_MS = 400 * 24 * 60 * 60 * 1000;
 const ENROLL_BODY_MAX_BYTES = 8 * 1024;
@@ -39,15 +40,20 @@ function escapeHtml(text: string): string {
 
 /**
  * The command the agency runs on its server. It downloads the pinned installer, checks its sha256 (GNU sha256sum or
- * macOS shasum), and only then runs it. The installer prompts for the enrol facts and the enrol code on its stdin,
- * so neither lands in shell history. The URL and the sha256 are grammar-checked values from readInstallerPin, and
- * the Worker URL is this request's origin, so nothing in the command needs shell quoting beyond the single quotes.
+ * macOS shasum), and only then runs it with `--enroll <Worker origin>`. The installer is a bash script that adds
+ * /enroll-host to the origin itself and refuses an origin with a path. Its preflight needs root on Ubuntu and
+ * refuses root on macOS, so the command runs it directly as root or on macOS, and through sudo otherwise. The
+ * installer prompts for the enrol facts and the enrol code on its terminal, so neither lands in shell history. The
+ * URL and the sha256 are grammar-checked values from readInstallerPin, and the origin is this request's own origin
+ * (no path), so nothing in the command needs shell quoting beyond the single quotes.
  */
-export function manualEnrolCommand(installerUrl: string, installerSha256: string, enrollUrl: string): string {
+export function manualEnrolCommand(installerUrl: string, installerSha256: string, workerOrigin: string): string {
+  const enrol = `--enroll '${workerOrigin}'`;
   return [
     `f=$(mktemp) && curl -fsSL --proto =https -o "$f" '${installerUrl}'`,
     `&& s=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)`,
-    `&& if [ "$s" = '${installerSha256}' ]; then DY_ENROLL_URL='${enrollUrl}' sh "$f"; else echo "the installer sha256 is $s, not the pinned one; nothing ran" >&2; fi;`,
+    `&& if [ "$s" = '${installerSha256}' ]; then if [ "$(id -u)" -eq 0 ] || [ "$(uname -s)" = Darwin ]; then bash "$f" ${enrol}; else sudo bash "$f" ${enrol}; fi;`,
+    `else echo "the installer sha256 is $s, not the pinned one; nothing ran" >&2; fi;`,
     `rm -f "$f"`,
   ].join(" ");
 }
@@ -60,14 +66,14 @@ export function handleEnrollHostPage(request: Request, env: Env): Response {
     body = `<p><strong>No command yet.</strong> ${escapeHtml(pin.detail)}</p>`;
   } else {
     const sha256 = pin.pin.sha256s[pin.pin.sha256s.length - 1];
-    const command = manualEnrolCommand(pinnedInstallerUrl(pin.pin.origin, sha256), sha256, `${origin}${ENROLL_HOST_PATH}`);
+    const command = manualEnrolCommand(pinnedInstallerUrl(pin.pin.origin, sha256), sha256, origin);
     body = [
       "<ol>",
       "<li>Put a new one-time enrol code in this Worker: <code>openssl rand -hex 32</code>, then <code>wrangler secret put HOST_ENROLL_CODE</code>.</li>",
-      "<li>On the server, as the admin login (root or a sudo user on Ubuntu, an admin user on macOS), run:</li>",
+      "<li>On the server, as the admin login (root or a sudo user on Ubuntu, an admin user on macOS), run it as you are logged in. It uses <code>sudo</code> itself when it is needed:</li>",
       "</ol>",
       `<pre>${escapeHtml(command)}</pre>`,
-      "<p>The installer asks for the enrol facts (the <code>dyenrol2.…</code> text the doubleyoup app shows for the server) and the enrol code. Paste them at the prompts, not on the command line.</p>",
+      "<p>The installer (a bash script) asks for the enrol facts (the <code>dyenrol2.…</code> text the doubleyoup app shows for the server) and the enrol code. Paste them at the prompts, not on the command line.</p>",
       `<p>Installer sha256: <code>${escapeHtml(sha256)}</code> (from this Worker's HOST_INSTALLER_SHA256S).</p>`,
     ].join("\n");
   }
@@ -75,36 +81,19 @@ export function handleEnrollHostPage(request: Request, env: Env): Response {
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
-/** Decode `dyenrol2.<base64url(JSON)>` into the seven validated facts, or the refusal reason. */
-export function decodeEnrolFacts(blob: unknown): { ok: true; facts: HostEnrolFacts } | { ok: false; reason: string } {
-  if (typeof blob !== "string" || !blob.startsWith(ENROL_FACTS_PREFIX) || blob.length > 4096) {
-    return { ok: false, reason: `enrolFacts must be the ${ENROL_FACTS_PREFIX}… text the app shows` };
-  }
-  const base64url = blob.slice(ENROL_FACTS_PREFIX.length);
-  if (!/^[A-Za-z0-9_-]+$/.test(base64url)) {
-    return { ok: false, reason: "enrolFacts is not base64url" };
-  }
-  let standard = base64url.replace(/-/g, "+").replace(/_/g, "/");
-  while (standard.length % 4 !== 0) {
-    standard += "=";
-  }
-  const bytes = base64Decode(standard);
-  if (bytes === null) {
-    return { ok: false, reason: "enrolFacts is not base64url" };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(utf8Text(bytes));
-  } catch {
-    return { ok: false, reason: "enrolFacts does not hold JSON" };
-  }
+/**
+ * Validate the facts object the installer posts: a JSON object, only the seven known keys, and every value inside
+ * its grammar (enrolFactsVerdict). An unknown key (for example hostAgentToken) is refused, so the facts cannot
+ * carry anything the Worker does not mean to accept.
+ */
+export function validateEnrolFactsObject(parsed: unknown): { ok: true; facts: HostEnrolFacts } | { ok: false; reason: string } {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ok: false, reason: "enrolFacts does not hold a JSON object" };
+    return { ok: false, reason: "facts must be a JSON object" };
   }
   const object = parsed as Record<string, unknown>;
   for (const key of Object.keys(object)) {
     if (!(HOST_ENROL_FACT_KEYS as readonly string[]).includes(key)) {
-      return { ok: false, reason: `enrolFacts has the unknown field "${key}"` };
+      return { ok: false, reason: `facts has the unknown field "${key}"` };
     }
   }
   const verdict = enrolFactsVerdict(object);
@@ -139,18 +128,18 @@ export async function handleEnrollHostPost(request: Request, env: Env): Promise<
   try {
     body = JSON.parse(bodyText);
   } catch {
-    return json({ ok: false, code: "bad-request", detail: "the body must be JSON { enrolCode, enrolFacts }" }, 400);
+    return json({ ok: false, code: "bad-request", detail: "the body must be JSON { facts, code }" }, 400);
   }
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
-    return json({ ok: false, code: "bad-request", detail: "the body must be JSON { enrolCode, enrolFacts }" }, 400);
+    return json({ ok: false, code: "bad-request", detail: "the body must be JSON { facts, code }" }, 400);
   }
-  const { enrolCode, enrolFacts } = body as { enrolCode?: unknown; enrolFacts?: unknown };
-  if (typeof enrolCode !== "string" || !(await codesEqual(code, enrolCode))) {
+  const { facts: givenFacts, code: givenCode } = body as { facts?: unknown; code?: unknown };
+  if (typeof givenCode !== "string" || !(await codesEqual(code, givenCode))) {
     console.warn("enroll-host: refused a wrong enrol code");
     return json({ ok: false, code: "enroll-code-wrong" }, 401);
   }
 
-  const facts = decodeEnrolFacts(enrolFacts);
+  const facts = validateEnrolFactsObject(givenFacts);
   if (!facts.ok) {
     return json({ ok: false, code: "bad-facts", detail: facts.reason }, 400);
   }
@@ -181,13 +170,22 @@ export async function handleEnrollHostPost(request: Request, env: Env): Promise<
 
   const sha256 = pin.pin.sha256s[pin.pin.sha256s.length - 1];
   const hostAgentToken = hexEncode(await deriveHostAgentToken(master.masterKey, facts.facts.cellId));
-  const jobLine = installerJobLine(
-    "host-enroll",
-    { ...facts.facts, mode: "start", installerUrl: pinnedInstallerUrl(pin.pin.origin, sha256), installerSha256: sha256 },
-    { hostAgentToken, tunnelToken: connector.token },
-  );
   console.log(`enroll-host: enrolled cell ${facts.facts.cellId} (label ${facts.facts.label})`);
-  return new Response(JSON.stringify({ ok: true, job: JSON.parse(jobLine) }), {
+  // The shape the installer reads (host-install.sh enroll_and_build_params): params is an object, and the two
+  // tokens are top-level keys. The installer sets mode itself; it is in params too, as the install params hold it.
+  const answer = {
+    ok: true,
+    params: {
+      ...facts.facts,
+      op: "host-enroll",
+      mode: "start",
+      installerUrl: pinnedInstallerUrl(pin.pin.origin, sha256),
+      installerSha256: sha256,
+    },
+    hostAgentToken,
+    tunnelToken: connector.token,
+  };
+  return new Response(JSON.stringify(answer), {
     status: 200,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
