@@ -54,6 +54,7 @@ export default defineConfig({
             "test/waf-edge-sync.test.ts",
             "test/media-soft-delete.test.ts",
             "test/host-ops.test.ts",
+            "test/enroll-host-installer.test.ts",
             "test/provision-ssh-keys.test.ts",
           ],
         },
