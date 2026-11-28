@@ -2907,6 +2907,68 @@ export function validateGcpInstanceSetMetadataParams(raw: unknown): ParamsVerdic
   return { ok: true, params };
 }
 
+// ── gcp-instance-startup-script-pin (hub#340, boot-state design §5.3) ────────────────
+// The GUARDED boot-pin write of a release: the Worker substitutes its placeholders into the platform's
+// render, reads the node's live `startup-script`, and writes the new one ONLY when every readonly line
+// other than DY_BUNDLE_URL / DY_BUNDLE_SHA256 stays byte-identical (actuate-startup-script-pin.ts).
+//
+// A separate op (not a flag on set-metadata) on purpose: an app or Worker that predates it REFUSES the
+// op name, where an unknown flag would be dropped by set-metadata's validator and the call would write
+// WITHOUT the guard.
+//
+// FOUR REQUIRED params and nothing else: `project`, `zone`, `name` (the set-metadata grammar) and
+// `startupScript` (the render, with placeholders; the grammar and the 256 KB cap of a `startup-script`
+// item). An UNKNOWN param is REFUSED, never dropped: there is no list of keys that may change and no
+// expectedFingerprint, so a caller cannot widen the guard, and a param this Worker does not know means the
+// caller expects behaviour this Worker does not have.
+//
+// IDEMPOTENT: a re-run reads again and answers `unchanged` once the write is in place.
+
+export interface GcpInstanceStartupScriptPinParams {
+  project: string;
+  zone: string;
+  name: string;
+  /** The platform's render of the node's startup script. May carry the allowlisted `@@DY_*@@` placeholders. */
+  startupScript: string;
+}
+
+const GCP_INSTANCE_STARTUP_SCRIPT_PIN_KEYS: readonly string[] = ["project", "zone", "name", "startupScript"];
+
+export function validateGcpInstanceStartupScriptPinParams(raw: unknown): ParamsVerdict<GcpInstanceStartupScriptPinParams> {
+  if (!isPlainObject(raw)) {
+    return { ok: false, reason: "params must be a JSON object" };
+  }
+  for (const key of Object.keys(raw)) {
+    if (!GCP_INSTANCE_STARTUP_SCRIPT_PIN_KEYS.includes(key)) {
+      return {
+        ok: false,
+        reason: `unknown param "${key}" — gcp-instance-startup-script-pin takes only ${GCP_INSTANCE_STARTUP_SCRIPT_PIN_KEYS.join(", ")}`,
+      };
+    }
+  }
+  const { project, zone, name, startupScript } = raw;
+
+  if (typeof project !== "string" || !GCP_PROJECT_ID_RE.test(project)) {
+    return { ok: false, reason: GCP_PROJECT_ID_RULE };
+  }
+  if (typeof zone !== "string" || zone.length > GCP_RESOURCE_NAME_MAX_LENGTH || !GCP_ZONE_RE.test(zone)) {
+    return { ok: false, reason: "zone must be a Compute Engine zone name (e.g. australia-southeast1-a)" };
+  }
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    return { ok: false, reason: `name ${GCP_RESOURCE_NAME_RULE}` };
+  }
+  if (
+    typeof startupScript !== "string" ||
+    startupScript.length === 0 ||
+    new TextEncoder().encode(startupScript).length > GCP_METADATA_VALUE_MAX_LENGTH
+  ) {
+    return { ok: false, reason: `startupScript must be a non-empty string of at most ${GCP_METADATA_VALUE_MAX_LENGTH} bytes` };
+  }
+
+  // A FRESH object of only the known keys — never the caller's object.
+  return { ok: true, params: { project, zone, name, startupScript } };
+}
+
 // ── gcp-instance-restart ─────────────────────────────────────────────────────────────
 // GRACEFULLY restart ONE VM in the AGENCY's own project: instances.stop (an ACPI shutdown the guest
 // OS honours — nfs-server stops, filesystems unmount), then instances.start. Deliberately NOT

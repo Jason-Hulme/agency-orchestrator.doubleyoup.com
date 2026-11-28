@@ -126,6 +126,9 @@ export const DISPATCH_OPS = [
   // tunnel's connectors (their origin IPs), for the pre-reboot checks.
   "gcp-instance-metadata-diff",
   "cf-tunnel-connections-get",
+  // hub#340 (boot-state design §5.3) — the GUARDED boot-pin write of a release: writes a node's new
+  // startup-script only when every readonly line other than the two bundle lines stays byte-identical.
+  "gcp-instance-startup-script-pin",
   // hub#43 — agency-owned media. READ one media bucket and the keys minted for it; MINT one bucket-scoped
   // key and stage it straight onto the site's file node (no answer to the platform carries it); DELETE one such key.
   "r2-media-buckets",

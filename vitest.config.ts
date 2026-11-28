@@ -45,6 +45,7 @@ export default defineConfig({
             "test/hub58-ops.test.ts",
             "test/hub43-r2-media.test.ts",
             "test/boot-metadata.test.ts",
+            "test/startup-script-pin.test.ts",
             "test/custom-hostname-ops.test.ts",
             "test/branded-media-ops.test.ts",
             "test/session-gate.test.ts",
