@@ -78,6 +78,8 @@
 //     op whose answer carries a credential, by design: a bulk offload engine needs it.
 // planning/47 decision G (actuate-p47.ts): `cf-tunnel-token-get` is a read, so it is idempotent, and so
 // are the review's two reads, `gcp-instance-metadata-diff` (it writes nothing) and `cf-tunnel-connections-get`.
+// hub#340 (actuate-startup-script-pin.ts): `gcp-instance-startup-script-pin` is idempotent: it reads and compares on
+// every run, writes at most once, and answers `unchanged` once the new script is in place.
 // The three hub#46 custom-hostname ops (actuate-custom-hostname.ts) are idempotent too: the upsert creates
 // only an ABSENT (or dead, `deleted`) hostname and otherwise reports the one there is, so a re-run after a
 // lost answer finds the hostname it created; `custom-hostname-get` is a read; `custom-hostname-delete`
@@ -276,6 +278,8 @@ import {
   validateGcpInstanceMetadataDiffParams,
   validateGcpDiskSnapshotCreateParams,
   validateGcpInstanceRemoveServiceAccountParams,
+  type GcpInstanceStartupScriptPinParams,
+  validateGcpInstanceStartupScriptPinParams,
 } from "./dispatch-params.js";
 import { actuateCfTunnelGet, actuateGcpDiskSnapshotCreate, actuateGcpInstanceRemoveServiceAccount } from "./actuate-hub58.js";
 import { actuateR2SiteKeyInstall, actuateR2SiteKeyRevoke, readR2MediaBuckets, readR2MediaState } from "./actuate-r2-media.js";
@@ -303,6 +307,7 @@ import {
 } from "./dispatch-params-media.js";
 import { actuateCfTunnelConnectionsGet, actuateCfTunnelTokenGet, actuateGcpInstanceMetadataDiff } from "./actuate-p47.js";
 import { actuateEdgeGateDeploy } from "./actuate-edge-gate.js";
+import { actuateGcpInstanceStartupScriptPin } from "./actuate-startup-script-pin.js";
 import {
   type HostBootstrapParams,
   type HostNetworkEnsureParams,
@@ -604,6 +609,10 @@ export const DISPATCH_OP_REGISTRY: Record<DispatchOp, RegisteredOp> = {
   "cf-tunnel-connections-get": defineOp<CfTunnelConnectionsGetParams>({
     validateParams: validateCfTunnelConnectionsGetParams,
     actuate: (params, env) => actuateCfTunnelConnectionsGet(params, env),
+  }),
+  "gcp-instance-startup-script-pin": defineOp<GcpInstanceStartupScriptPinParams>({
+    validateParams: validateGcpInstanceStartupScriptPinParams,
+    actuate: (params, env) => actuateGcpInstanceStartupScriptPin(params, env),
   }),
   "media-bucket-protect": defineOp<MediaBucketProtectParams>({
     validateParams: validateMediaBucketProtectParams,
